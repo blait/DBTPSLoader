@@ -14,26 +14,29 @@ import logging
 
 from ..config import TargetDB
 from ..db import connect
+from .ident import qualify
 
 log = logging.getLogger(__name__)
 
 
-def _stats(target: TargetDB, database: str, tables: list[str]) -> dict[str, dict]:
-    """테이블별 {행수, 체크섬}. 조회 실패는 error로 남긴다."""
+def _stats(target: TargetDB, database: str,
+           tables: list[tuple[str, str]]) -> dict[str, dict]:
+    """테이블별 {행수, 체크섬}. `tables`는 (schema, name) 목록."""
     out: dict[str, dict] = {}
     with connect(target, database, autocommit=True) as conn:
         cur = conn.cursor()
-        for t in tables:
+        for sch, name in tables:
+            key = f"{sch}.{name}"
             try:
                 # CHECKSUM_AGG는 컬럼 값까지 반영하므로 행수만 보는 것보다 강하다.
                 # BINARY_CHECKSUM은 순서 무관이라 삽입 순서가 달라도 일치한다.
                 row = cur.execute(
                     f"SELECT COUNT_BIG(*), CHECKSUM_AGG(BINARY_CHECKSUM(*)) "
-                    f"FROM dbo.[{t}]").fetchone()
-                out[t] = {"rows": int(row[0] or 0), "checksum": row[1]}
+                    f"FROM {qualify(sch, name)}").fetchone()
+                out[key] = {"rows": int(row[0] or 0), "checksum": row[1]}
             except Exception as exc:  # noqa: BLE001
-                out[t] = {"error": str(exc)[:200]}
-                log.warning("대조 조회 실패 (%s.%s): %s", database, t, exc)
+                out[key] = {"error": str(exc)[:200]}
+                log.warning("대조 조회 실패 (%s.%s): %s", database, key, exc)
     return out
 
 
@@ -44,16 +47,18 @@ def compare_data(a: TargetDB, b: TargetDB, plan: dict) -> dict:
     기본값이 있으면 값이 갈린다 — 그래서 행수 불일치와 체크섬 불일치를 나눠
     보고하고, 전자만 확실한 문제로 다룬다.
     """
-    by_db: dict[str, list[str]] = {}
+    by_db: dict[str, list[tuple[str, str]]] = {}
     for t in plan.get("tables", []):
         if t.get("rows", 0) > 0:
-            by_db.setdefault(t["database"], []).append(t["table"])
+            by_db.setdefault(t["database"], []).append(
+                (t.get("schema", "dbo"), t["table"]))
 
     rows_differ, checksum_differ, errors, matched = [], [], [], 0
     for db, tables in by_db.items():
         sa = _stats(a, db, sorted(tables))
         sb = _stats(b, db, sorted(tables))
-        for t in sorted(tables):
+        for sch, name in sorted(tables):
+            t = f"{sch}.{name}"
             ra, rb = sa.get(t, {}), sb.get(t, {})
             if "error" in ra or "error" in rb:
                 errors.append({"database": db, "table": t,

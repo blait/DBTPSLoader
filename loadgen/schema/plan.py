@@ -102,10 +102,12 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
         for pos, key in enumerate(order):
             t = tables[key]
             insertable = [c for c in t.columns if c.insertable]
+            uniq_ix = [ix for ix in t.indexes if ix.unique and not ix.primary_key]
             kind, weight = _classify(t, ref_count.get(key, 0))
             entries.append({
                 "database": db, "table": t.name, "schema": t.schema,
                 "qualified": key,
+                "temporal": t.temporal,
                 "order": pos,
                 "kind": kind,
                 "_weight": weight,
@@ -127,17 +129,25 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
                 "warnings": [w for w in (
                     "트리거 있음 — 삽입 시 부수 효과가 생길 수 있다" if t.has_trigger else None,
                     "CHECK 제약 있음 — 합성값이 거부될 수 있다" if t.has_check else None,
-                    "삽입 가능한 컬럼이 없다" if not insertable else None,
+                    "시스템 버전 관리(temporal) 테이블 — 이력이 함께 생성된다"
+                    if t.temporal else None,
+                    "삽입 가능한 컬럼이 없다 (IDENTITY/계산 컬럼뿐)"
+                    if not insertable else None,
+                    # 유니크 제약에 임의값을 넣으면 중복 키 위반이 난다. 행수가
+                    # 값 공간보다 크면 확률이 급격히 올라간다.
+                    f"유니크 제약 {len(uniq_ix)}개 — 행수가 많으면 중복 키 위반 가능"
+                    if uniq_ix else None,
                 ) if w],
             })
 
     # 가중치대로 총 행수를 분배
-    total_w = sum(e["_weight"] for e in entries) or 1
+    # 삽입 가능한 컬럼이 없는 테이블은 가중치 계산에서도 빼야 한다 — 넣지도 않을
+    # 테이블에 배분한 몫만큼 나머지가 줄어든다.
+    seedable = [e for e in entries if e["columns"]]
+    total_w = sum(e["_weight"] for e in seedable) or 1
     for e in entries:
-        if e["warnings"] and "삽입 가능한 컬럼이 없다" in e["warnings"][-1]:
-            e["rows"] = 0
-        else:
-            e["rows"] = max(_MIN_ROWS, round(total_rows * e["_weight"] / total_w))
+        e["rows"] = (max(_MIN_ROWS, round(total_rows * e["_weight"] / total_w))
+                     if e["columns"] else 0)
         del e["_weight"]
 
     entries.sort(key=lambda e: (e["database"], e["order"]))

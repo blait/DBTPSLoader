@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -21,6 +20,7 @@ from typing import Callable, Optional
 from ..config import SeedConfig, TargetDB
 from ..db import connect
 from ..schema.guard import require_empty
+from ..schema.ident import qualify, quote
 from .datagen import Gen
 
 log = logging.getLogger(__name__)
@@ -36,19 +36,22 @@ class TableSeed:
     table: str
     columns: list[str]
     factory: Callable  # (g: Gen, i: int, total: int, ctx: dict) -> tuple
-    count_key: str  # ctx key holding target row count
+    count_key: str  # 목표 행수를 담은 ctx 키
+    schema: str = "dbo"   # dbo가 아닌 스키마도 대상이 된다
 
 
 # ---------------------------------------------------------------------------
-# Insert machinery
+# 삽입 기계
 # ---------------------------------------------------------------------------
 
 def _insert_range(target: TargetDB, ts: TableSeed, start: int, end: int, total: int,
                   ctx: dict, batch_size: int, on_rows: Callable[[int], None]) -> None:
-    cols = ", ".join(f"[{c}]" for c in ts.columns)
+    cols = ", ".join(quote(c) for c in ts.columns)
     ph = ", ".join("?" for _ in ts.columns)
-    sql = f"INSERT INTO dbo.[{ts.table}] ({cols}) VALUES ({ph})"
-    g = Gen(seed=zlib.crc32(f"{ts.table}:{start}".encode()))  # stable across processes/runs
+    sql = f"INSERT INTO {qualify(ts.schema, ts.table)} ({cols}) VALUES ({ph})"
+    # 시드를 테이블명+오프셋으로 정한다. 스키마명까지 넣는 이유: 서로 다른 스키마에
+    # 같은 이름의 테이블이 있으면 같은 데이터가 들어가 버린다.
+    g = Gen(seed=zlib.crc32(f"{ts.schema}.{ts.table}:{start}".encode()))
     with connect(target, ts.database, autocommit=False) as conn:
         cur = conn.cursor()
         cur.fast_executemany = True
@@ -66,91 +69,88 @@ def _insert_range(target: TargetDB, ts: TableSeed, start: int, end: int, total: 
             on_rows(len(batch))
 
 
-def _set_fk_checks(target: TargetDB, database: str, enable: bool) -> None:
+def _set_fk_checks(target: TargetDB, database: str, enable: bool) -> list[str]:
+    """모든 사용자 테이블의 제약을 켜거나 끈다. 실패한 테이블 목록을 돌려준다.
+
+    `sp_MSforeachtable`을 쓰지 않는다. 그것은 (1) 문서화되지 않은 프로시저라 관리형
+    인스턴스에서 막힐 수 있고, (2) 한 테이블에서 실패하면 나머지를 건너뛰며,
+    (3) 무엇이 실패했는지 알려주지 않는다.
+
+    직접 순회하면 권한이 없는 테이블만 건너뛰고 이유를 남길 수 있다. 삽입 전에
+    제약을 끄는 것은 FK 순서가 완벽하지 않아도 진행되게 하려는 것이므로, 일부
+    테이블에서 실패해도 전체를 중단할 이유는 없다.
+    """
     action = "CHECK" if enable else "NOCHECK"
+    failed: list[str] = []
     with connect(target, database) as conn:
-        conn.cursor().execute(
-            f"EXEC sp_MSforeachtable 'ALTER TABLE ? {action} CONSTRAINT ALL'"
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT s.name, t.name FROM sys.tables t "
+            "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+            "WHERE t.is_ms_shipped = 0 AND t.temporal_type <> 2"
         )
+        tables = cur.fetchall()
+        for sch, name in tables:
+            try:
+                cur.execute(f"ALTER TABLE {qualify(sch, name)} {action} CONSTRAINT ALL")
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{sch}.{name}: {str(exc)[:120]}")
+    if failed:
+        log.warning("제약 %s 실패 %d개 (권한 또는 시스템 버전 관리 테이블): %s",
+                    action, len(failed), failed[0])
+    return failed
 
 
-def _column_meta(cur, table: str) -> list[dict]:
-    cur.execute(
-        """
-        SELECT c.name, t.name AS type_name, c.max_length, c.is_nullable,
-               c.is_identity, c.is_computed
-        FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
-        WHERE c.object_id = OBJECT_ID(?) ORDER BY c.column_id
-        """,
-        f"dbo.[{table}]",
-    )
-    return [
-        {"name": r[0], "type": r[1], "max_length": r[2], "nullable": bool(r[3]),
-         "identity": bool(r[4]), "computed": bool(r[5])}
-        for r in cur.fetchall()
-    ]
-
-
-def _generic_value(g: Gen, meta: dict, i: int):
-    t = meta["type"]
-    if meta["nullable"]:
-        return None
-    if t in ("int", "bigint", "smallint"):
-        return i % 1000 + 1
-    if t == "tinyint":
-        return i % 100
-    if t == "bit":
-        return False
-    if t in ("decimal", "numeric", "money", "float", "real"):
-        return 1.0
-    if t in ("nvarchar", "varchar", "nchar", "char", "sysname"):
-        maxlen = meta["max_length"]
-        nchars = 20 if maxlen == -1 else max(1, (maxlen // 2 if t.startswith("n") else maxlen))
-        return f"x{i}"[:nchars].ljust(min(nchars, 2), "x")
-    if t in ("datetime2", "datetime", "smalldatetime", "date"):
-        return g.dt()
-    if t == "time":
-        return "12:00:00"
-    if t == "uniqueidentifier":
-        return str(uuid.UUID(int=g.rng.getrandbits(128)))
-    if t in ("varbinary", "binary", "image"):
-        return b"\x00"
-    return None
-
-
-def seed_minimal(target: TargetDB, database: str, skip_tables: set[str], rows: int = 10,
+def seed_minimal(target: TargetDB, database: str, skip: set[str], rows: int = 10,
                  progress: Optional[ProgressCb] = None) -> list[str]:
-    """Insert a handful of rows into every empty non-hot table. Returns failures."""
-    failures = []
+    """플랜에 없는 빈 테이블에 소량의 행을 넣는다. 실패 목록을 돌려준다.
+
+    목적은 FK 조인 읽기가 빈 결과를 돌려주지 않게 하는 것이다. 부모 테이블이
+    비어 있으면 조인이 0행을 반환하는데, 그것도 "성공한 트랜잭션"으로 집계되어
+    서버가 일을 거의 하지 않고도 TPS가 높게 나온다.
+
+    `skip`은 "schema.table" 형식이다. 스키마명을 포함하지 않으면 서로 다른 스키마의
+    동명 테이블을 구분할 수 없다.
+    """
+    from ..schema.introspect import introspect
+    from ..schema.values import value_for
+
+    failures: list[str] = []
+    try:
+        tables = introspect(target, database)
+    except Exception as exc:  # noqa: BLE001
+        return [f"{database}: 스키마 조회 실패 — {str(exc)[:200]}"]
+
     with connect(target, database, autocommit=False) as conn:
         cur = conn.cursor()
-        cur.execute("SELECT name FROM sys.tables WHERE is_ms_shipped = 0 ORDER BY name")
-        tables = [r[0] for r in cur.fetchall()]
         g = Gen(seed=42)
-        for t in tables:
-            if t in skip_tables:
+        for key, t in sorted(tables.items()):
+            if key in skip or t.row_count > 0:
                 continue
+            insertable = [c for c in t.columns if c.insertable]
+            if not insertable:
+                continue   # IDENTITY만 있는 테이블 — 넣을 것이 없다
+            cols = ", ".join(quote(c.name) for c in insertable)
+            ph = ", ".join("?" for _ in insertable)
+            sql = f"INSERT INTO {qualify(t.schema, t.name)} ({cols}) VALUES ({ph})"
+            fk_of = {fk.columns[0]: fk.ref_table.split(".")[-1]
+                     for fk in t.foreign_keys if len(fk.columns) == 1}
             try:
-                cur.execute(f"SELECT COUNT(*) FROM dbo.[{t}]")
-                if cur.fetchone()[0] > 0:
-                    continue
-                metas = [m for m in _column_meta(cur, t)
-                         if not m["identity"] and not m["computed"]
-                         and m["type"] not in ("timestamp", "rowversion")]
-                if not metas:
-                    continue
-                cols = ", ".join(f"[{m['name']}]" for m in metas)
-                ph = ", ".join("?" for _ in metas)
-                sql = f"INSERT INTO dbo.[{t}] ({cols}) VALUES ({ph})"
-                data = [tuple(_generic_value(g, m, i) for m in metas) for i in range(1, rows + 1)]
+                data = [
+                    tuple(value_for(c, g, i, rows, {}, fk_parent=fk_of.get(c.name))
+                          for c in insertable)
+                    for i in range(1, rows + 1)
+                ]
                 cur.executemany(sql, data)
                 conn.commit()
                 if progress:
-                    progress(f"{database}.{t}", rows, rows)
+                    progress(f"{database}.{key}", rows, rows)
             except Exception as e:  # noqa: BLE001
                 conn.rollback()
-                failures.append(f"{t}: {str(e)[:200]}")
-                log.warning("minimal seed failed for %s.%s: %s", database, t, e)
+                # 조용히 넘기지 않는다 — 사용자가 왜 조인이 빈 결과를 주는지
+                # 알 수 있어야 한다.
+                failures.append(f"{key}: {str(e)[:200]}")
+                log.warning("최소 시딩 실패 %s.%s: %s", database, key, e)
     return failures
 
 
@@ -176,24 +176,32 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
     require_empty(target, databases)
 
     seeds = [
-        TableSeed(database=t["database"], table=t["table"], columns=t["columns"],
-                  factory=t["factory"], count_key=t["table"])
+        TableSeed(database=t["database"], table=t["table"],
+                  schema=t.get("schema", "dbo"), columns=t["columns"],
+                  factory=t["factory"], count_key=t["table"].lower())
         for t in tables
     ]
-    ctx = {t["table"]: t["rows"] for t in tables}
+    # ctx 키는 테이블명 소문자다 — 워크로드의 `of` 참조와 맞춰야 한다.
+    # 서로 다른 스키마에 동명 테이블이 있으면 큰 쪽을 남긴다 (FK 부모로 쓰일 때
+    # 범위가 좁으면 위반이 나므로, 좁은 쪽을 남기는 것이 더 위험하다).
+    ctx: dict[str, int] = {}
+    for t in tables:
+        k = t["table"].lower()
+        ctx[k] = max(ctx.get(k, 0), t["rows"])
 
     done_lock = threading.Lock()
-    done: dict[str, int] = {ts.table: 0 for ts in seeds}
+    done: dict[str, int] = {f"{ts.schema}.{ts.table}": 0 for ts in seeds}
 
+    fk_off_failures: list[str] = []
     for db in databases:
-        _set_fk_checks(target, db, enable=False)
+        fk_off_failures += _set_fk_checks(target, db, enable=False)
 
     jobs = []  # (ts, start, end, total)
-    for ts in seeds:
-        total = ctx[ts.count_key]
+    for t, ts in zip(tables, seeds):
+        total = t["rows"]     # 플랜의 값을 그대로 쓴다 (ctx의 max가 아니라)
         for start in range(1, total + 1, CHUNK):
             jobs.append((ts, start, min(start + CHUNK - 1, total), total))
-    # large jobs first for better pool utilization
+    # 큰 작업부터 — 스레드풀 활용도를 높인다
     jobs.sort(key=lambda j: -(j[2] - j[1]))
 
     errors: list[str] = []
@@ -204,10 +212,11 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
             return
 
         def on_rows(n, _t=ts, _total=total):
+            key = f"{_t.schema}.{_t.table}"
             with done_lock:
-                done[_t.table] += n
+                done[key] += n
                 if progress:
-                    progress(f"{_t.database}.{_t.table}", done[_t.table], _total)
+                    progress(f"{_t.database}.{key}", done[key], _total)
 
         _insert_range(target, ts, start, end, total, ctx, cfg.batch_size, on_rows)
 
@@ -217,23 +226,30 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
             exc = f.exception()
             if exc:
                 errors.append(str(exc)[:300])
-                log.error("seed job failed: %s", exc)
+                log.error("시딩 작업 실패: %s", exc)
 
     # 플랜에 없는 테이블에도 최소 행을 넣어, FK 조인 읽기가 빈 결과를 돌려주지 않게 한다.
-    seeded = {ts.table for ts in seeds}
-    minimal_failures = []
+    seeded = {f"{ts.schema}.{ts.table}" for ts in seeds}
+    minimal_failures: list[str] = []
     for db in databases:
-        minimal_failures += seed_minimal(target, db, skip_tables=seeded, progress=progress)
+        minimal_failures += seed_minimal(target, db, skip=seeded, progress=progress)
 
+    fk_on_failures: list[str] = []
     for db in databases:
         try:
-            _set_fk_checks(target, db, enable=True)
+            fk_on_failures += _set_fk_checks(target, db, enable=True)
         except Exception as e:  # noqa: BLE001
-            log.warning("re-enabling FK checks on %s failed: %s", db, e)
+            fk_on_failures.append(f"{db}: {str(e)[:200]}")
+            log.warning("%s의 제약 재활성화 실패: %s", db, e)
 
     return {
         "targets": dict(ctx),
         "inserted": done,
         "errors": errors,
         "minimal_seed_failures": minimal_failures,
+        # 제약을 끄거나 켜지 못한 테이블. 끄지 못했으면 FK 순서 문제로 삽입이
+        # 실패할 수 있고, 켜지 못했으면 DB가 제약 미검증 상태로 남는다 —
+        # 어느 쪽도 조용히 넘기면 안 된다.
+        "constraint_off_failures": fk_off_failures,
+        "constraint_on_failures": fk_on_failures,
     }

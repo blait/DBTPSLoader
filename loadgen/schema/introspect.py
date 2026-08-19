@@ -16,6 +16,12 @@ from ..db import connect
 
 log = logging.getLogger(__name__)
 
+# 부하 파라미터로 쓸 수 있는 PK 타입. 순번을 뽑아 넣을 수 있어야 한다.
+NUMERIC_TYPES = ("int", "bigint", "smallint", "tinyint", "decimal", "numeric")
+
+# INSERT 컬럼 목록에서 항상 빠지는 타입.
+_NEVER_INSERT = ("timestamp", "rowversion")
+
 
 @dataclass
 class Column:
@@ -28,12 +34,18 @@ class Column:
     identity: bool
     computed: bool
     default: str | None = None
+    generated: bool = False   # GENERATED ALWAYS (temporal 테이블의 period 컬럼)
 
     @property
     def insertable(self) -> bool:
-        """INSERT 컬럼 목록에 넣을 수 있는가."""
-        return not self.identity and not self.computed and \
-            self.type not in ("timestamp", "rowversion")
+        """INSERT 컬럼 목록에 넣을 수 있는가.
+
+        temporal 테이블의 period 컬럼(GENERATED ALWAYS)을 반드시 제외해야 한다 —
+        SQL Server가 직접 삽입을 거부하므로, 포함하면 해당 테이블의 시딩이 전부
+        실패한다.
+        """
+        return (not self.identity and not self.computed and not self.generated
+                and self.type not in _NEVER_INSERT)
 
 
 @dataclass
@@ -65,6 +77,7 @@ class Table:
     row_count: int = 0
     has_trigger: bool = False
     has_check: bool = False
+    temporal: bool = False    # SYSTEM_VERSIONED — 시딩 대상에서 제외해야 한다
 
     @property
     def qualified(self) -> str:
@@ -76,9 +89,23 @@ class Table:
         return self.primary_key[0] if len(self.primary_key) == 1 else None
 
     @property
-    def identity_pk(self) -> str | None:
-        """IDENTITY인 단일 PK — append-only 판정과 id 범위의 기준."""
+    def numeric_single_pk(self) -> str | None:
+        """단일 컬럼 **숫자형** PK. 부하 파라미터로 쓸 수 있는 유일한 형태다.
+
+        uniqueidentifier나 문자열 PK를 걸러내는 것이 요점이다. 그런 PK에 정수를
+        넣으면 조회가 항상 0행을 돌려주는데, 그것도 "성공한 트랜잭션"으로 집계되어
+        서버는 일을 거의 하지 않고 TPS만 높게 나온다 — 부하가 조용히 무의미해진다.
+        """
         pk = self.single_pk
+        if not pk:
+            return None
+        col = next((c for c in self.columns if c.name == pk), None)
+        return pk if col and col.type in NUMERIC_TYPES else None
+
+    @property
+    def identity_pk(self) -> str | None:
+        """IDENTITY인 단일 숫자형 PK — append-only 판정의 기준."""
+        pk = self.numeric_single_pk
         if not pk:
             return None
         col = next((c for c in self.columns if c.name == pk), None)
@@ -87,27 +114,31 @@ class Table:
 
 # --------------------------------------------------------------------- 조회 SQL
 
+# temporal_type: 0=비temporal, 1=이력 테이블, 2=시스템 버전 관리 테이블.
+# 이력 테이블(1)은 아예 제외한다 — 사용자가 직접 쓰는 테이블이 아니고 삽입도 막혀 있다.
 _Q_TABLES = """
 SELECT s.name, t.name,
        (SELECT SUM(p.rows) FROM sys.partitions p
         WHERE p.object_id = t.object_id AND p.index_id IN (0, 1)),
        (SELECT COUNT(*) FROM sys.triggers tr WHERE tr.parent_id = t.object_id),
-       (SELECT COUNT(*) FROM sys.check_constraints cc WHERE cc.parent_object_id = t.object_id)
+       (SELECT COUNT(*) FROM sys.check_constraints cc WHERE cc.parent_object_id = t.object_id),
+       t.temporal_type
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
-WHERE t.is_ms_shipped = 0
+WHERE t.is_ms_shipped = 0 AND t.temporal_type <> 1
 ORDER BY s.name, t.name
 """
 
 _Q_COLUMNS = """
 SELECT s.name, t.name, c.name, ty.name, c.max_length, c.precision, c.scale,
-       c.is_nullable, c.is_identity, c.is_computed, dc.definition
+       c.is_nullable, c.is_identity, c.is_computed, dc.definition,
+       c.generated_always_type
 FROM sys.columns c
 JOIN sys.tables t ON t.object_id = c.object_id
 JOIN sys.schemas s ON s.schema_id = t.schema_id
 JOIN sys.types ty ON ty.user_type_id = c.user_type_id
 LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
-WHERE t.is_ms_shipped = 0
+WHERE t.is_ms_shipped = 0 AND t.temporal_type <> 1
 ORDER BY s.name, t.name, c.column_id
 """
 
@@ -150,20 +181,22 @@ def introspect(target: TargetDB, database: str) -> dict[str, Table]:
         cur = conn.cursor()
 
         cur.execute(_Q_TABLES)
-        for sch, name, rows, trig, chk in cur.fetchall():
+        for sch, name, rows, trig, chk, temporal in cur.fetchall():
             tables[f"{sch}.{name}"] = Table(
                 database=database, schema=sch, name=name,
-                row_count=int(rows or 0), has_trigger=bool(trig), has_check=bool(chk))
+                row_count=int(rows or 0), has_trigger=bool(trig), has_check=bool(chk),
+                temporal=(temporal == 2))
 
         cur.execute(_Q_COLUMNS)
-        for sch, tname, cname, ctype, mlen, prec, scale, nul, ident, comp, dflt in cur.fetchall():
+        for (sch, tname, cname, ctype, mlen, prec, scale, nul, ident, comp,
+             dflt, gen) in cur.fetchall():
             t = tables.get(f"{sch}.{tname}")
             if t is None:
                 continue
             t.columns.append(Column(
                 name=cname, type=ctype, max_length=mlen, precision=prec, scale=scale,
                 nullable=bool(nul), identity=bool(ident), computed=bool(comp),
-                default=dflt))
+                default=dflt, generated=bool(gen)))
 
         cur.execute(_Q_INDEXES)
         idx_acc: dict[tuple[str, str], Index] = {}
@@ -210,6 +243,8 @@ def to_dict(tables: dict[str, Table]) -> dict:
                 "primary_key": t.primary_key,
                 "identity_pk": t.identity_pk,
                 "has_trigger": t.has_trigger, "has_check": t.has_check,
+                "temporal": t.temporal,
+                "numeric_single_pk": t.numeric_single_pk,
                 "columns": [
                     {"name": c.name, "type": c.type, "max_length": c.max_length,
                      "nullable": c.nullable, "identity": c.identity,

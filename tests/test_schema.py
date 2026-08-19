@@ -226,3 +226,177 @@ def test_draft_workload_prefers_larger_tables():
     schema["dbo.account"].row_count = 100
     w = draft_workload({"db": schema}, max_tables=1)
     assert all("audit_log" in t["name"] for t in w["txns"])
+
+
+# ============================================================================
+# 실전 스키마 대응 — 오픈소스 배포에서는 사용자 스키마를 고를 수 없다
+# ============================================================================
+
+from loadgen.schema.ident import qualify, quote  # noqa: E402
+
+
+def test_quote_escapes_closing_bracket():
+    # SQL Server는 [My]Table] 같은 이름을 허용한다. 이스케이프하지 않으면 인용이
+    # 조기에 끝나 문법 오류가 나거나 의도하지 않은 SQL이 실행된다.
+    assert quote("My]Table") == "[My]]Table]"
+    assert quote("Order") == "[Order]"
+
+
+def test_qualify_non_dbo_schema():
+    assert qualify("sales", "Invoice") == "[sales].[Invoice]"
+    assert qualify(None, "T") == "[dbo].[T]"
+
+
+def test_reserved_words_are_quoted_in_generated_sql():
+    # [Order], [Select] 같은 예약어는 실제 스키마에 흔하다
+    t = _table("Order", [
+        _col("Id", "int", identity=True),
+        _col("Select", "nvarchar", max_length=100),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=100)
+    w = draft_workload({"db": {"dbo.Order": t}}, max_tables=5)
+    for txn in w["txns"]:
+        for sql in txn["sql"]:
+            assert "[Order]" in sql or "[Select]" in sql
+            # 인용 없는 맨 이름이 SQL에 남으면 문법 오류가 된다
+            assert " Order " not in sql.replace("[Order]", "")
+
+
+def test_non_dbo_schema_in_generated_sql():
+    t = _table("Invoice", [
+        _col("Id", "int", identity=True),
+        _col("Amount", "decimal", scale=2),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=100)
+    t.schema = "sales"
+    w = draft_workload({"db": {"sales.Invoice": t}}, max_tables=5)
+    assert w["txns"], "스키마가 dbo가 아니면 트랜잭션이 생성되지 않았다"
+    for txn in w["txns"]:
+        for sql in txn["sql"]:
+            assert "[sales].[Invoice]" in sql
+        # ranges/ctx가 찾을 수 있도록 스키마 포함 참조여야 한다
+        assert "sales.Invoice" in txn["tables"]
+
+
+def test_composite_pk_produces_no_id_based_txn():
+    # 복합 PK에 단일 값을 넣으면 조회가 항상 0행이고, 그것도 성공으로 집계된다
+    t = _table("order_line", [
+        _col("OrderId"), _col("LineNo"), _col("Qty"),
+    ], pk=["OrderId", "LineNo"], rows=1000)
+    assert t.single_pk is None
+    assert t.numeric_single_pk is None
+    w = draft_workload({"db": {"dbo.order_line": t}}, max_tables=5)
+    assert not [x for x in w["txns"] if x["name"].endswith("_by_pk")]
+    assert not [x for x in w["txns"] if x["name"].endswith("_update")]
+
+
+def test_guid_pk_is_not_used_as_id_range():
+    # uniqueidentifier PK에 정수를 넣으면 0행 조회가 된다
+    t = _table("session", [
+        _col("Id", "uniqueidentifier", max_length=16),
+        _col("Token", "nvarchar", max_length=200),
+    ], pk=["Id"], rows=1000)
+    assert t.single_pk == "Id"
+    assert t.numeric_single_pk is None      # 숫자형이 아니므로 제외
+    w = draft_workload({"db": {"dbo.session": t}}, max_tables=5)
+    assert not [x for x in w["txns"] if x["name"].endswith("_by_pk")]
+
+
+def test_composite_fk_skipped_in_join_draft():
+    parent = _table("order_line", [_col("OrderId"), _col("LineNo")],
+                    pk=["OrderId", "LineNo"], rows=100)
+    child = _table("shipment", [
+        _col("Id", "int", identity=True), _col("OrderId"), _col("LineNo"),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=100,
+        fks=[ForeignKey("fk", ["OrderId", "LineNo"], "dbo.order_line",
+                        ["OrderId", "LineNo"])])
+    w = draft_workload({"db": {"dbo.order_line": parent, "dbo.shipment": child}},
+                       max_tables=5)
+    # 복합 FK 조인은 만들지 않는다 (값 조합을 맞출 수 없다)
+    assert not [x for x in w["txns"] if "_join_" in x["name"]]
+
+
+def test_generated_always_column_not_insertable():
+    # temporal 테이블의 period 컬럼은 SQL Server가 직접 삽입을 거부한다
+    c = _col("ValidFrom", "datetime2", max_length=8, generated=True)
+    assert c.insertable is False
+
+
+def test_rowversion_not_insertable():
+    assert _col("V", "timestamp", max_length=8).insertable is False
+
+
+def test_check_constraint_blocks_write_draft():
+    # 합성값이 CHECK를 만족하지 못하면 매 시도가 실패한다 — 실패를 성능으로
+    # 읽는 것보다 쓰기를 안 만드는 것이 낫다
+    t = _table("payment", [
+        _col("Id", "int", identity=True),
+        _col("Amount", "decimal", scale=2),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=1000, has_check=True)
+    w = draft_workload({"db": {"dbo.payment": t}}, max_tables=5)
+    assert w["write_count"] == 0
+    assert w["read_count"] > 0      # 읽기는 여전히 만든다
+
+
+def test_trigger_blocks_write_draft():
+    t = _table("audit", [
+        _col("Id", "int", identity=True),
+        _col("Detail", "nvarchar", max_length=200),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=1000, has_trigger=True)
+    assert draft_workload({"db": {"dbo.audit": t}}, max_tables=5)["write_count"] == 0
+
+
+def test_unique_column_not_chosen_as_update_target():
+    # 유니크 컬럼에 임의값을 넣으면 중복 키 위반이 난다
+    t = _table("account", [
+        _col("Id", "int", identity=True),
+        _col("Email", "nvarchar", max_length=200),
+        _col("Nickname", "nvarchar", max_length=100),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=1000,
+        indexes=[Index("UQ_Email", ["Email"], [], True, False)])
+    w = draft_workload({"db": {"dbo.account": t}}, max_tables=5)
+    upd = [x for x in w["txns"] if x["name"].endswith("_update")]
+    assert upd
+    assert "[Email]" not in upd[0]["sql"][0]
+
+
+def test_unreadable_types_excluded_from_select():
+    # xml·geography는 pyodbc 변환에 실패하거나 페이로드가 과도하다
+    t = _table("doc", [
+        _col("Id", "int", identity=True),
+        _col("Body", "xml", max_length=-1),
+        _col("Loc", "geography", max_length=-1),
+        _col("Title", "nvarchar", max_length=200),
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=1000)
+    w = draft_workload({"db": {"dbo.doc": t}}, max_tables=5)
+    for txn in w["txns"]:
+        for sql in txn["sql"]:
+            assert "[Body]" not in sql and "[Loc]" not in sql
+
+
+def test_identity_only_table_gets_zero_rows():
+    # 넣을 컬럼이 없으면 행수 배분에서도 빠져야 한다
+    ident = _table("ticket", [_col("Id", "int", identity=True)], pk=["Id"])
+    normal = _table("note", [_col("Id", "int", identity=True),
+                             _col("Body", "nvarchar", max_length=200)], pk=["Id"])
+    plan = draft_plan({"db": {"dbo.ticket": ident, "dbo.note": normal}},
+                      total_rows=10_000)
+    rows = {t["table"]: t["rows"] for t in plan["tables"]}
+    assert rows["ticket"] == 0
+    assert rows["note"] > 0
+    tk = next(t for t in plan["tables"] if t["table"] == "ticket")
+    assert any("삽입 가능한 컬럼이 없다" in w for w in tk["warnings"])
+
+
+def test_insert_draft_includes_fk_parents_in_tables():
+    # FK 부모가 tables에 없으면 id 범위가 조회되지 않아 error 547이 된다
+    schema = _simple_schema()
+    w = draft_workload({"db": schema}, max_tables=10)
+    ins = [x for x in w["txns"] if x["name"] == "order_insert"]
+    if ins:
+        assert "dbo.account" in ins[0]["tables"]
