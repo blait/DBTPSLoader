@@ -639,3 +639,56 @@ def test_dryrun_reports_param_failure_without_db():
     assert r["ready"] is False
     assert r["results"][0]["status"] == "error"
     assert "파라미터 생성 실패" in r["results"][0]["error"]
+
+
+# ============================================================================
+# 실제 RDS에서 발견한 버그 — 로컬 테스트로는 안 잡혔다
+# ============================================================================
+
+def test_composite_pk_last_column_is_sequential():
+    # 복합 PK의 각 컬럼이 난수면 조합이 충돌한다. 실제 RDS에서 PK_OrderLine
+    # 위반으로 배치가 죽었다.
+    t = _table("order_line", [
+        _col("OrderId", "bigint"), _col("LineNo"), _col("Sku", "nvarchar", max_length=80),
+    ], pk=["OrderId", "LineNo"])
+    f = make_factory(t, ["OrderId", "LineNo", "Sku"])
+    g = Gen(seed=1)
+    keys = [tuple(f(g, i, 6000, {})[:2]) for i in range(1, 6001)]
+    assert len(set(keys)) == len(keys), f"복합 PK 중복 {len(keys)-len(set(keys))}건"
+
+
+def test_narrow_int_pk_stays_in_range():
+    # tinyint(0~255) PK에 300행을 요청하면 "Numeric value out of range"로 죽는다
+    t = _table("currency", [_col("Id", "tinyint", max_length=1),
+                            _col("Code", "char", max_length=3)], pk=["Id"])
+    f = make_factory(t, ["Id", "Code"])
+    g = Gen(seed=1)
+    vals = [f(g, i, 400, {})[0] for i in range(1, 401)]
+    assert max(vals) <= 255, f"tinyint 범위 초과: {max(vals)}"
+
+
+def test_plan_caps_rows_by_pk_type():
+    # 값 생성이 되접기로 버티더라도 유일성이 깨진다. 플랜에서 막는 것이 정답이다.
+    cur = _table("currency", [_col("Id", "tinyint", max_length=1),
+                              _col("Code", "char", max_length=3)], pk=["Id"])
+    log = _table("log", [_col("Id", "bigint", identity=True),
+                         _col("Msg", "nvarchar", max_length=200),
+                         _col("At", "datetime2", max_length=8)], pk=["Id"])
+    plan = draft_plan({"db": {"dbo.currency": cur, "dbo.log": log}},
+                      total_rows=500_000)
+    c = next(t for t in plan["tables"] if t["table"] == "currency")
+    assert c["rows"] <= 255
+    assert any("PK 타입 최대값" in w for w in c["warnings"])
+    # IDENTITY PK는 SQL Server가 관리하므로 제한하지 않는다
+    lg = next(t for t in plan["tables"] if t["table"] == "log")
+    assert lg["rows"] > 255
+
+
+def test_decimal_stays_realistic():
+    # precision만 보면 decimal(18,2)가 1조를 넘는 값을 만든다. 문법상 유효하지만
+    # 비현실적이고, 큰 정수부는 pyodbc 변환에서 "out of range"가 된다.
+    g = Gen(seed=1)
+    for prec, scale in ((18, 2), (12, 2), (38, 10)):
+        c = _col("Amt", "decimal", precision=prec, scale=scale)
+        mx = max(value_for(c, g, i, 100, {}) for i in range(300))
+        assert mx < 10_000_000, f"decimal({prec},{scale})가 {mx:,.0f}를 만들었다"

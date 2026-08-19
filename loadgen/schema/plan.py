@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 
 from .introspect import Table
-from .values import can_generate
+from .values import INT_MAX, can_generate
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +142,12 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
                     for c in t.columns if not c.insertable
                 ],
                 "pk": t.primary_key,
+                # 좁은 정수 PK의 상한. IDENTITY면 SQL Server가 관리하므로 제외.
+                "pk_cap": next(
+                    (INT_MAX[col.type] for pk in ([t.primary_key[-1]]
+                                                  if t.primary_key else [])
+                     for col in [next((c for c in t.columns if c.name == pk), None)]
+                     if col and not col.identity and col.type in INT_MAX), None),
                 "foreign_keys": [
                     {"columns": fk.columns, "ref_table": fk.ref_table,
                      "ref_columns": fk.ref_columns}
@@ -166,6 +172,16 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
         ok = bool(e["columns"]) and not e["blockers"]
         e["rows"] = max(_MIN_ROWS, round(total_rows * e["_weight"] / total_w)) if ok else 0
         del e["_weight"]
+
+    # 좁은 정수 PK는 타입 최대값을 넘길 수 없다. tinyint(255) 컬럼에 314행을
+    # 배분하면 순번이 되접혀 PK가 충돌한다 — 실측으로 발견했다.
+    for e in entries:
+        if e["rows"] and e.get("pk_cap") and e["rows"] > e["pk_cap"]:
+            e["warnings"].append(
+                f"행수를 {e['rows']:,} → {e['pk_cap']:,}로 낮췄다 "
+                f"(PK 타입 최대값)")
+            e["rows"] = e["pk_cap"]
+        e.pop("pk_cap", None)
 
     entries.sort(key=lambda e: (e["database"], e["order"]))
     return {

@@ -42,6 +42,9 @@ GENERATABLE = frozenset(
     )
 )
 
+# 정수 타입별 최대값. PK 순번이 이걸 넘으면 삽입이 죽는다.
+INT_MAX = {"tinyint": 255, "smallint": 32_767, "int": 2_147_483_647}
+
 # nullable 컬럼이 NULL이 될 확률. 0이면 실제 데이터와 다르고, 100이면 인덱스가
 # 무의미해진다. 실제 스키마에서 nullable은 "때때로 빈다"는 뜻이므로 소수로 둔다.
 NULL_PCT = 12
@@ -66,22 +69,35 @@ def _text_chars(c: Column) -> int:
     return max(1, min(n, 400))
 
 
+# decimal 생성값의 현실적 상한. precision이 허용하더라도 이 이상은 만들지 않는다.
+#
+# 이유가 두 가지다. (1) `decimal(18,2)`의 정수부는 16자리라 1조를 넘는 값이
+# 나오는데, 금액·수량 컬럼에 그런 값이 들어가면 데이터가 비현실적이 된다.
+# (2) 큰 정수부를 float로 다루면 pyodbc 변환에서 "Numeric value out of range"가
+# 나 배치 전체가 죽는다 — 실제 RDS에서 `decimal(12,2)`가 이 이유로 실패했다.
+_DECIMAL_SOFT_MAX = 1_000_000.0
+
+
 def _decimal_value(c: Column, g: Gen) -> float:
-    """선언된 precision/scale 안에 들어가는 값.
+    """선언된 precision/scale 안에 들어가면서 현실적인 값.
 
     `decimal(p, s)`의 절대 최대는 10**(p-s) - 10**-s 다. precision을 무시하고
     0~10000을 생성하면 `decimal(5,4)`(최대 9.9999)에서 사실상 모든 행이
     "Arithmetic overflow"로 죽는다.
+
+    반대로 precision만 보고 최대까지 채우면 `decimal(18,2)`가 1조를 넘는 값을
+    만든다. 두 제약을 모두 지켜야 한다.
     """
     if c.type in ("money", "smallmoney"):
-        # money는 고정 scale 4. smallmoney의 범위는 ±214,748.3647
-        hi = 200_000.0 if c.type == "money" else 200_000.0
+        # money 범위는 ±922조지만 위 이유로 낮춰 잡는다.
+        # smallmoney는 ±214,748.3647이므로 그보다 작게.
+        hi = _DECIMAL_SOFT_MAX if c.type == "money" else 200_000.0
         return g.dec(0, hi, 4)
     prec = c.precision or 18
     scale = min(c.scale or 0, prec)
     int_digits = max(prec - scale, 1)
     # 상한을 조금 낮춰 잡는다 — 반올림으로 자릿수가 하나 올라가면 오버플로다.
-    hi = 10 ** int_digits * 0.9
+    hi = min(10 ** int_digits * 0.9, _DECIMAL_SOFT_MAX)
     return g.dec(0, hi, scale)
 
 
@@ -122,7 +138,12 @@ def value_for(c: Column, g: Gen, i: int, total: int, ctx: dict,
 
     # PK·유니크 정수 컬럼은 순번을 쓴다. 난수를 쓰면 100만 행에서 37%가 충돌한다.
     if sequential and t in ("int", "bigint", "smallint", "tinyint", "decimal", "numeric"):
-        return i
+        # 타입 범위를 넘으면 "Numeric value out of range"로 배치가 죽는다.
+        # tinyint(0~255) 컬럼에 300행을 요청하는 일이 실제로 있다 — 실측으로
+        # 발견했다. 되접어서 범위 안에 남기되, 그러면 유일성이 깨지므로
+        # 플랜 단계에서 행수를 제한하는 것이 정답이다 (plan.py의 max_rows).
+        cap = INT_MAX.get(t)
+        return (i - 1) % cap + 1 if cap else i
 
     if c.nullable and not unique and g.bit(NULL_PCT):
         return None
@@ -198,9 +219,22 @@ def make_factory(t: Table, columns: list[str]):
     # 실패하거나(NOCHECK면) 중복이 남아 선택도가 왜곡된다.
     unique_cols = {ix.columns[0] for ix in t.indexes
                    if ix.unique and len(ix.columns) == 1}
-    # PK가 IDENTITY가 아니면 우리가 값을 넣어야 하고, 반드시 유일해야 한다.
-    pk_cols = set(t.primary_key) if len(t.primary_key) == 1 else set()
-    seq_cols = {c for c in (pk_cols | unique_cols)
+
+    # PK가 IDENTITY가 아니면 우리가 값을 넣어야 하고 유일해야 한다.
+    #
+    # **복합 PK도 포함한다.** 단일 PK만 처리하면 복합 PK의 각 컬럼이 난수가 되어
+    # 조합이 충돌한다 — 실제 RDS에서 `PK_OrderLine` 위반으로 배치가 죽었다.
+    # 복합 PK는 마지막 컬럼만 순번으로 두고 앞 컬럼은 FK/난수를 유지해야
+    # 부모 참조가 성립하는데, 그러면 조합의 유일성이 깨진다. 그래서 마지막
+    # 컬럼에 행 순번을 쓴다 — 앞 컬럼이 같아도 뒤가 다르므로 조합은 유일하다.
+    pk_cols = set(t.primary_key)
+    if len(t.primary_key) > 1:
+        # 앞 컬럼은 FK일 수 있으므로 건드리지 않고, 마지막만 순번으로.
+        seq_pk = {t.primary_key[-1]}
+    else:
+        seq_pk = pk_cols
+
+    seq_cols = {c for c in (seq_pk | unique_cols)
                 if (col := by_name.get(c)) and not col.identity
                 and col.type in ("int", "bigint", "smallint", "tinyint",
                                  "decimal", "numeric")}
@@ -211,7 +245,7 @@ def make_factory(t: Table, columns: list[str]):
         return tuple(
             value_for(c, g, i, total, ctx,
                       fk_parent=fk_of.get(c.name),
-                      unique=c.name in unique_cols or c.name in pk_cols,
+                      unique=c.name in unique_cols or c.name in seq_pk,
                       sequential=c.name in seq_cols)
             for c in cols
         )
