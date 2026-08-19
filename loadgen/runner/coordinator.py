@@ -24,7 +24,9 @@ class Run:
         self.cfg = cfg
         self.workload = workload
         self.on_point = on_point
-        self.run_id = new_run_id(f"{target.label}_{cfg.profile}_{cfg.mode}")
+        # 워크로드 이름을 넣는다 — cfg에는 더 이상 profile이 없다.
+        self.run_id = new_run_id(
+            f"{target.label}_{workload.get('name', 'workload')}_{cfg.mode}")
         self.status = "created"
         self.started_at: Optional[float] = None
         self.ended_at: Optional[float] = None

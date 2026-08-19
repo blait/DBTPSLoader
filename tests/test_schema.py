@@ -725,3 +725,21 @@ def test_insert_draft_skipped_when_not_null_unsupported():
     ], pk=["Id"], rows=1000)
     w = draft_workload({"db": {"dbo.audit": t}}, max_tables=5)
     assert not [x for x in w["txns"] if x["name"].endswith("_insert")]
+
+
+def test_varbinary_is_deterministic():
+    # os.urandom은 시드와 무관하다 — 같은 플랜을 두 인스턴스에 적용해도 다른
+    # 데이터가 들어가 쌍 비교의 전제(양쪽 동일)가 깨진다. 실제 RDS에서
+    # sales.Order의 체크섬이 이 컬럼 때문에 갈렸다.
+    c = _col("Payload", "varbinary", max_length=-1)
+    a = value_for(c, Gen(seed=7), 1, 10, {})
+    b = value_for(c, Gen(seed=7), 1, 10, {})
+    assert a == b and len(a) > 100
+
+
+def test_run_id_does_not_use_removed_profile():
+    # cfg.profile은 제거됐다. coordinator가 그것을 참조하면 부하가 시작조차 못 한다.
+    import inspect
+    from loadgen.runner import coordinator
+    src = inspect.getsource(coordinator)
+    assert "cfg.profile" not in src

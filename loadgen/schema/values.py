@@ -19,7 +19,6 @@ NOT NULL 컬럼에서 배치 전체가 실패한다. 생성 가능 여부를 미
 """
 from __future__ import annotations
 
-import os
 import uuid
 from datetime import timedelta
 
@@ -170,7 +169,10 @@ def value_for(c: Column, g: Gen, i: int, total: int, ctx: dict,
         return f"/{i}/"
     if t in _BIN_TYPES:
         n = _MAX_BLOB_BYTES if c.max_length in (-1, None) else min(c.max_length, _MAX_BLOB_BYTES)
-        return os.urandom(max(1, n))
+        # os.urandom을 쓰면 안 된다 — 시드와 무관해서 같은 플랜을 두 인스턴스에
+        # 적용해도 다른 데이터가 들어간다. 쌍 비교는 양쪽 데이터가 같아야
+        # 성립하는데, 실제 RDS에서 이 컬럼 때문에 체크섬이 갈렸다.
+        return g.rng.randbytes(max(1, n))
     if t in _TEXT_TYPES:
         n = _text_chars(c)
         low = c.name.lower()
