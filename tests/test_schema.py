@@ -692,3 +692,36 @@ def test_decimal_stays_realistic():
         c = _col("Amt", "decimal", precision=prec, scale=scale)
         mx = max(value_for(c, g, i, 100, {}) for i in range(300))
         assert mx < 10_000_000, f"decimal({prec},{scale})가 {mx:,.0f}를 만들었다"
+
+
+def test_insert_param_respects_decimal_precision():
+    # decimal(5,4)에 max 10000을 넣으면 매 INSERT가 산술 오버플로다
+    from loadgen.workload.draft import _param_for
+    spec = _param_for(_col("Rate", "decimal", precision=5, scale=4))
+    assert spec["max"] < 10.0 and spec["q"] == 4
+
+
+def test_insert_param_unique_column_uses_varying_gen():
+    # 유니크 컬럼에 email 생성기를 쓰면 중복 키 위반이 쌓인다
+    from loadgen.workload.draft import _param_for
+    c = _col("Email", "nvarchar", max_length=400)
+    assert _param_for(c, unique=False)["gen"] == "email"
+    assert _param_for(c, unique=True)["gen"] == "token"
+
+
+def test_insert_param_none_for_unsupported_not_null():
+    # NOT NULL time 컬럼에 NULL을 넣으면 23000으로 배치가 죽는다
+    from loadgen.workload.draft import _param_for
+    assert _param_for(_col("AtTime", "time", max_length=5, nullable=False)) is None
+    assert _param_for(_col("AtTime", "time", max_length=5, nullable=True)) is not None
+
+
+def test_insert_draft_skipped_when_not_null_unsupported():
+    # 값을 만들 수 없는 NOT NULL 컬럼이 있으면 INSERT를 만들지 않는다
+    t = _table("audit", [
+        _col("Id", "bigint", identity=True),
+        _col("AtTime", "time", max_length=5),      # NOT NULL, 생성 불가
+        _col("CreatedAt", "datetime2", max_length=8),
+    ], pk=["Id"], rows=1000)
+    w = draft_workload({"db": {"dbo.audit": t}}, max_tables=5)
+    assert not [x for x in w["txns"] if x["name"].endswith("_insert")]

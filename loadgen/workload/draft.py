@@ -42,32 +42,59 @@ _UNREADABLE = ("xml", "geography", "geometry", "hierarchyid", "sql_variant",
 _UNWRITABLE = _UNREADABLE
 
 
-def _param_for(c: Column) -> dict:
-    """컬럼 하나에 넣을 파라미터 명세."""
+def _param_for(c: Column, unique: bool = False) -> dict | None:
+    """컬럼 하나에 넣을 파라미터 명세. 값을 만들 수 없으면 None.
+
+    **컬럼 제약을 반드시 반영해야 한다.** 실제 RDS에서 세 가지로 실패했다:
+    NOT NULL 컬럼에 NULL(`const: None`)을 넣어 23000, `decimal(5,4)`에 최대
+    10000을 넣어 22003, 유니크 컬럼에 중복 가능한 값을 넣어 23000.
+
+    `unique`면 매 실행마다 다른 값이 나오는 생성기를 쓴다 — 유니크 인덱스가
+    걸린 컬럼에 INSERT하면서 중복을 내면 부하가 에러만 쌓는다.
+    """
     t = c.type
-    if t in _DATE_TYPES:
+    if t in _UNWRITABLE:
+        return None
+    if t in _DATE_TYPES or t == "date":
         return {"gen": "datetime"}
+    if t == "datetimeoffset":
+        # 부하 파라미터에는 tz-aware 생성기가 없다. 이 컬럼이 NOT NULL이면
+        # 트랜잭션을 만들지 않는 편이 낫다.
+        return None if not c.nullable else {"gen": "const", "value": None}
+    if t == "time":
+        return None if not c.nullable else {"gen": "const", "value": None}
     if t == "bit":
         return {"gen": "bit"}
     if t == "uniqueidentifier":
         return {"gen": "uuid"}
-    if t in ("varbinary", "binary", "image"):
-        return {"gen": "const", "value": None}
     if t in _TEXT_TYPES:
         # max_length는 바이트. n계열은 2바이트/문자이고 -1은 MAX.
-        nbytes = 80 if c.max_length in (-1, None) else min(c.max_length, 400)
-        if "email" in c.name.lower():
+        nchars = 40 if c.max_length in (-1, None) else (
+            c.max_length // 2 if t.startswith("n") else c.max_length)
+        nchars = max(1, min(nchars, 200))
+        low = c.name.lower()
+        if unique:
+            # 매 실행마다 달라야 한다. token은 길이를 지정할 수 있어 안전하다.
+            return {"gen": "token", "len": min(nchars, 24)}
+        if "email" in low and nchars >= 24:
             return {"gen": "email"}
-        if any(k in c.name.lower() for k in ("name", "title")):
+        if any(k in low for k in ("name", "title")) and nchars >= 12:
             return {"gen": "name"}
-        return {"gen": "text", "bytes": max(2, nbytes)}
-    if t in ("decimal", "numeric", "money", "float", "real"):
-        return {"gen": "decimal", "min": 0, "max": 10000}
-    if t in ("int", "bigint", "smallint"):
-        return {"gen": "int", "min": 1, "max": 1000}
+        return {"gen": "text", "bytes": nchars * 2}
+    if t in ("decimal", "numeric", "money", "smallmoney"):
+        # precision/scale을 지켜야 한다. decimal(5,4)의 최대는 9.9999다.
+        prec, scale = c.precision or 18, min(c.scale or 0, c.precision or 18)
+        hi = min(10 ** max(prec - scale, 1) * 0.9, 1_000_000.0)
+        return {"gen": "decimal", "min": 0, "max": hi, "q": scale}
+    if t in ("float", "real"):
+        return {"gen": "decimal", "min": 0, "max": 10000, "q": 4}
+    if t in ("int", "bigint"):
+        return {"gen": "int", "min": 1, "max": 10 ** 6 if t == "int" else 10 ** 9}
+    if t == "smallint":
+        return {"gen": "int", "min": 1, "max": 30000}
     if t == "tinyint":
-        return {"gen": "int", "min": 0, "max": 100}
-    return {"gen": "const", "value": None}
+        return {"gen": "int", "min": 0, "max": 255}
+    return None
 
 
 def _fk_param(fk_col: str, t: Table) -> dict | None:
@@ -171,10 +198,32 @@ def _writes(t: Table, db: str) -> list[dict]:
         return out
 
     writable = [c for c in insertable if c.type not in _UNWRITABLE]
+    # 유니크 인덱스가 걸린 컬럼은 매 실행마다 다른 값이 나와야 한다.
+    unique_cols = {ix.columns[0] for ix in t.indexes
+                   if ix.unique and len(ix.columns) == 1}
 
     # append INSERT — IDENTITY PK + 날짜 컬럼이면 로그성으로 본다.
     if writable and t.identity_pk and has_date:
-        params = [_fk_param(c.name, t) or _param_for(c) for c in writable]
+        # 값을 만들 수 없는 컬럼(NOT NULL time/datetimeoffset 등)이 있으면
+        # nullable인 것만 빼고, NOT NULL이면 트랜잭션을 만들지 않는다.
+        pairs, blocked = [], []
+        for c in writable:
+            spec = _fk_param(c.name, t) or _param_for(c, unique=c.name in unique_cols)
+            if spec is None:
+                if c.nullable:
+                    continue          # 컬럼 목록에서 제외 — DB가 NULL을 넣는다
+                blocked.append(f"{c.name}({c.type})")
+                continue
+            pairs.append((c, spec))
+        if blocked:
+            log.info("%s: %s 때문에 INSERT 초안을 만들지 않았다", ref, ", ".join(blocked))
+            pairs = []
+        cols_used = [c for c, _ in pairs]
+        params = [spec for _, spec in pairs]
+        writable = cols_used
+    else:
+        writable = []
+    if writable:
         cols = ", ".join(quote(c.name) for c in writable)
         ph = ", ".join("?" for _ in writable)
         # FK 부모까지 tables에 넣어야 id 범위가 조회된다 — 없으면 파라미터가
@@ -196,10 +245,13 @@ def _writes(t: Table, db: str) -> list[dict]:
         # 유니크 컬럼에 임의값을 넣으면 중복 키 위반이 난다.
         unique_cols = {c for ix in t.indexes if ix.unique and not ix.primary_key
                        for c in ix.columns}
-        target = next((c for c in writable
+        # UPDATE 대상은 INSERT에서 제외된 컬럼도 후보다 (원본 컬럼 목록을 쓴다).
+        cand = [c for c in insertable if c.type not in _UNWRITABLE]
+        target = next((c for c in cand
                        if not _fk_param(c.name, t) and c.name not in unique_cols
                        and c.name != pk
-                       and (c.type in _TEXT_TYPES or c.type in _NUM_TYPES)), None)
+                       and (c.type in _TEXT_TYPES or c.type in _NUM_TYPES)
+                       and _param_for(c) is not None), None)
         if target:
             out.append({
                 "name": f"{t.name.lower()}_update", "kind": "write", "weight": 10,
