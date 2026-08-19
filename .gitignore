@@ -34,3 +34,6 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# 스크럽 패턴 — 걸러야 할 문자열 자체가 저장소에 남으면 안 된다
+.scrub-patterns

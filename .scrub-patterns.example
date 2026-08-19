@@ -1,0 +1,24 @@
+# 공개 전 스크럽 검사 패턴 (grep -E 형식, 한 줄에 하나)
+#
+# 이 파일을 .scrub-patterns 로 복사해 실제로 걸러야 할 문자열을 넣는다.
+# .scrub-patterns 는 .gitignore 대상이다 — 걸러야 할 문자열 자체가
+# 저장소에 남으면 안 되기 때문이다.
+#
+# 사용:
+#   git grep -inE "$(paste -sd'|' - < <(grep -v '^#' .scrub-patterns | grep .))" -- .
+#
+# 아래는 형식 예시다. 실제 값으로 바꿔 쓸 것.
+
+# AWS 계정 ID (12자리)
+[0-9]{12}
+
+# 사설 키
+BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY
+
+# DB 엔드포인트
+\.rds\.amazonaws\.com
+
+# 인프라 식별자
+(sg|i|vpc|subnet)-[0-9a-f]{8,17}
+
+# 조직·제품 코드명, 계정명, 패스워드는 여기에 직접 추가한다
