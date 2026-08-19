@@ -1,0 +1,52 @@
+# 부하 생성기만 띄운다. 대상 DB는 사용자가 준비한 것을 쓴다.
+#
+#   docker compose up --build
+#   → http://localhost:8010
+#
+# 대상 DB를 로컬에 함께 띄워 시험해보려면:
+#   docker compose --profile demo up --build
+#   → mssql-a:1433 / mssql-b:1434 가 함께 뜬다 (빈 인스턴스이므로
+#     스키마는 직접 적용해야 한다 — 이 도구는 스키마를 만들지 않는다)
+
+services:
+  loadgen:
+    build: .
+    ports:
+      - "127.0.0.1:8010:8010"   # 기본은 로컬 바인딩. 외부에 열려면 이 줄을 고칠 것
+    environment:
+      # 비워두면 인증이 비활성된다. 로컬 바인딩이 아니면 반드시 설정할 것.
+      LOADGEN_PASSWORD: "${LOADGEN_PASSWORD:-}"
+      # RDS Enhanced Monitoring에서 CPU를 읽을 때만 필요하다.
+      AWS_REGION: "${AWS_REGION:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+    volumes:
+      # 측정 결과와 사용자가 편집한 플랜·워크로드는 호스트에 남겨야 한다.
+      - ./runs:/app/runs
+      - ./plans:/app/plans
+      - ./workloads:/app/workloads
+      # 비교 쌍 설정. local 파일이 있으면 그쪽이 우선한다.
+      - ./comparisons.yaml:/app/comparisons.yaml:ro
+
+  # ---- 아래는 --profile demo 를 줄 때만 뜬다 ----
+  # 시험용 빈 SQL Server 2대. 쌍 비교 흐름을 태워보려면 2대가 필요하다.
+  # 컨테이너 SQL Server는 성능 측정에 쓸 수 없다 — 부하기와 CPU를 나눠 쓰고
+  # 컨테이너가 먼저 한계에 닿는다. 기능 확인용이다.
+  mssql-a:
+    profiles: ["demo"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    ports: ["127.0.0.1:1433:1433"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_SA_PASSWORD: "${DEMO_SA_PASSWORD:?DEMO_SA_PASSWORD를 설정할 것}"
+
+  mssql-b:
+    profiles: ["demo"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    ports: ["127.0.0.1:1434:1433"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_SA_PASSWORD: "${DEMO_SA_PASSWORD:?DEMO_SA_PASSWORD를 설정할 것}"

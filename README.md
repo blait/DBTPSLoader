@@ -47,16 +47,48 @@ vCPU 조정, 스토리지 변경 같은 결정을 실측으로 뒷받침하는 �
 
 ## 빠른 시작
 
-### 1. 설치
+### 1. 실행 — Docker (권장)
+
+ODBC 드라이버 설치가 이 도구의 최대 진입장벽이므로 이미지에 담아 뒀다.
 
 ```bash
-# ODBC Driver 18 for SQL Server (macOS)
+docker compose up --build
+# → http://localhost:8010
+```
+
+<details>
+<summary>직접 설치하려면</summary>
+
+```bash
+# ODBC Driver 18 for SQL Server
+# macOS
 brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release
 brew install msodbcsql18
+# Debian/Ubuntu → https://learn.microsoft.com/sql/connect/odbc/linux-mac/
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn loadgen.app:app --host 127.0.0.1 --port 8010
 ```
+</details>
+
+### ⚠️ 인증
+
+부하를 거는 도구이므로 **패스워드 없이는 루프백에서만 동작한다.**
+다른 주소에서 접근하면 403으로 차단된다.
+
+```bash
+LOADGEN_PASSWORD='<강한-패스워드>' docker compose up
+```
+
+| 환경변수 | 기본값 | 용도 |
+|---|---|---|
+| `LOADGEN_PASSWORD` | (없음) | 미설정 시 루프백 전용 |
+| `LOADGEN_SESSION_TTL` | `28800` (8시간) | 세션 만료 |
+| `LOADGEN_COOKIE_SECURE` | `0` | TLS 뒤에 둘 때 `1` |
+
+공유 패스워드 하나뿐이므로 다중 사용자 환경에는 적합하지 않다. 그런 경우
+리버스 프록시에서 인증을 처리할 것.
 
 ### 2. 대상 DB 준비 (사용자 몫)
 
@@ -70,6 +102,7 @@ docker run -d --name mssql-b ... -p 1434:1433 ...
 ```
 
 ### 3. 비교 쌍 설정
+
 
 `comparisons.yaml`을 `comparisons.local.yaml`로 복사해 편집한다 (후자가 우선하고
 `.gitignore` 대상이다).
@@ -85,11 +118,7 @@ pairs:
 
 `vcpu`를 반드시 적을 것 — 이유는 아래 **왜 CPU%를 그대로 비교하면 안 되는가** 참조.
 
-### 4. 실행
-
-```bash
-.venv/bin/uvicorn loadgen.app:app --host 127.0.0.1 --port 8010
-```
+### 4. 사용
 
 브라우저에서 `http://localhost:8010` — 왼쪽 패널 순서가 곧 작업 순서다.
 
@@ -205,6 +234,24 @@ tests/                순수 함수 테스트 (DB 불필요)
 
 **INSERT 부하는 DB를 계속 키운다.** 런을 반복하면 나중 런이 더 큰 테이블을
 상대하므로, `run_ladder.py`는 양쪽을 번갈아 실행해 편향을 상쇄한다.
+
+### 자동 생성을 건너뛰는 경우
+
+부하가 조용히 무의미해지는 것보다 아무것도 만들지 않는 편이 낫다. 아래 경우는
+초안에서 제외하고 이유를 표시하므로, 필요하면 직접 SQL을 작성해야 한다.
+
+| 대상 | 이유 |
+|---|---|
+| 복합 PK, GUID·문자열 PK | 단일 정수를 넣으면 조회가 항상 0행인데 "성공"으로 집계된다 |
+| 복합 FK | 값 조합을 스키마만 보고 맞출 수 없다 |
+| CHECK 제약·트리거 보유 테이블 (쓰기) | 합성값이 거부되거나 부수 효과가 생긴다 |
+| 유니크 컬럼 (UPDATE 대상) | 임의값을 넣으면 중복 키 위반 |
+| `xml`·`geography`·`hierarchyid`·`sql_variant` | 드라이버 변환 실패 또는 과도한 페이로드 |
+| temporal 테이블의 period 컬럼 | SQL Server가 직접 삽입을 거부한다 |
+| IDENTITY만 있는 테이블 | 넣을 컬럼이 없다 |
+
+`dbo`가 아닌 스키마, 예약어 이름(`[Order]`, `[User]`), 대괄호·비ASCII 문자를 포함한
+이름은 모두 정상 처리된다.
 
 ---
 

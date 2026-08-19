@@ -11,11 +11,13 @@ import logging
 import os
 import secrets
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse)
 from pydantic import BaseModel
 
 from . import comparisons, presets
@@ -84,49 +86,146 @@ def _load_targets_file() -> None:
         log.info("pre-registered target %s (%s)", t.label, t.host)
 
 
-# ------------------------------------------------------------ password gate
+# ------------------------------------------------------------ 패스워드 게이트
+#
+# 이 도구는 DB에 쓰기 부하를 거는 도구다. 인증 없이 네트워크에 열면 누구나
+# 대상 DB에 부하를 걸 수 있다.
+#
+# 패스워드가 없으면 **루프백에서만** 동작한다. 원래는 패스워드 미설정 시 인증이
+# 통째로 비활성됐는데, 환경변수 하나를 빼먹으면 완전히 열리는 구조였다.
+# 편의(로컬 개발)와 안전(외부 노출 차단)을 바인딩 주소로 구분한다.
 
 GATE_PASSWORD = os.environ.get("LOADGEN_PASSWORD", "")
-_sessions: set = set()
+SESSION_TTL = int(os.environ.get("LOADGEN_SESSION_TTL", 8 * 3600))
+# 쿠키에 Secure를 붙일지. TLS 종단 뒤에 두면 1로 설정한다.
+COOKIE_SECURE = os.environ.get("LOADGEN_COOKIE_SECURE", "0") == "1"
 
-LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>loadgen login</title>
+_sessions: dict[str, float] = {}       # 토큰 -> 만료 epoch
+_login_fails: dict[str, list[float]] = {}   # IP -> 최근 실패 시각
+_LOGIN_WINDOW, _LOGIN_MAX = 300.0, 10      # 5분에 10회
+
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+LOGIN_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><title>loadgen 로그인</title>
 <style>body{background:#0f1419;color:#d8dee6;font:15px sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}
 form{background:#1a2129;border:1px solid #2c3742;border-radius:8px;padding:32px;width:300px}
 input{width:100%;padding:8px;margin:8px 0;background:#0d1116;color:#d8dee6;border:1px solid #2c3742;border-radius:5px;box-sizing:border-box}
-button{width:100%;padding:9px;background:#4da3ff;color:#fff;border:0;border-radius:5px;cursor:pointer}</style></head>
-<body><form method="post" action="/login"><h3>MSSQL HT PoC</h3>
-<input type="password" name="password" placeholder="password" autofocus>
-<button>Login</button></form></body></html>"""
+button{width:100%;padding:9px;background:#4da3ff;color:#fff;border:0;border-radius:5px;cursor:pointer}
+p{font-size:12px;color:#5c6773}</style></head>
+<body><form method="post" action="/login"><h3>mssql-loadgen</h3>
+<input type="password" name="password" placeholder="패스워드" autofocus>
+<button>로그인</button>__MSG__</form></body></html>"""
+
+BLOCKED_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><title>loadgen</title>
+<style>body{background:#0f1419;color:#d8dee6;font:15px sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center}
+div{max-width:520px;padding:28px;background:#1a2129;border:1px solid #e5534b;border-radius:8px}
+code{background:#0d1116;padding:2px 6px;border-radius:4px}</style></head>
+<body><div><h3>인증이 설정되지 않았다</h3>
+<p>이 도구는 대상 DB에 쓰기 부하를 걸 수 있으므로, 루프백이 아닌 주소에서는
+패스워드 없이 사용할 수 없다.</p>
+<p><code>LOADGEN_PASSWORD</code> 환경변수를 설정해 다시 시작하거나,
+<code>127.0.0.1</code>로 접속할 것.</p></div></body></html>"""
+
+
+def _peer_ip(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+def _is_loopback(request: Request) -> bool:
+    """리버스 프록시 헤더를 신뢰하지 않는다 — 위조하면 인증을 우회할 수 있다.
+
+    TCP 피어 주소만 본다. 프록시 뒤에 둘 경우 피어는 프록시가 되므로 루프백으로
+    보일 수 있는데, 그런 배치에서는 패스워드를 설정하는 것이 전제다.
+    """
+    return _peer_ip(request) in _LOOPBACK
+
+
+def _prune_sessions(now: float) -> None:
+    """만료된 세션을 지운다. 원래는 제거 경로가 없어 무한히 쌓였다."""
+    for tok in [t for t, exp in _sessions.items() if exp <= now]:
+        _sessions.pop(tok, None)
 
 
 def _authed(request: Request) -> bool:
-    if not GATE_PASSWORD:
-        return True  # gate disabled (local dev)
-    return request.cookies.get("loadgen_session", "") in _sessions
+    now = time.time()
+    _prune_sessions(now)
+    tok = request.cookies.get("loadgen_session", "")
+    return bool(tok) and _sessions.get(tok, 0) > now
 
 
 @app.middleware("http")
 async def gate(request: Request, call_next):
-    if GATE_PASSWORD and request.url.path not in ("/login", "/favicon.ico"):
-        if not _authed(request):
-            if request.url.path.startswith("/api"):
-                return HTMLResponse('{"detail":"unauthorized"}', status_code=401,
-                                    media_type="application/json")
-            return HTMLResponse(LOGIN_HTML)
+    path = request.url.path
+    if path in ("/login", "/favicon.ico", "/healthz"):
+        return await call_next(request)
+
+    if not GATE_PASSWORD:
+        # 패스워드가 없으면 루프백만 허용한다. fail-open이 아니라 fail-closed다.
+        if _is_loopback(request):
+            return await call_next(request)
+        log.warning("인증 미설정 상태에서 외부 접근 차단: %s", _peer_ip(request))
+        if path.startswith("/api"):
+            return JSONResponse(
+                {"detail": "LOADGEN_PASSWORD가 설정되지 않았다 — 루프백에서만 사용 가능"},
+                status_code=403)
+        return HTMLResponse(BLOCKED_HTML, status_code=403)
+
+    if not _authed(request):
+        if path.startswith("/api"):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        # 미인증 페이지에 200을 주면 캐시·모니터가 정상으로 오인한다.
+        return HTMLResponse(LOGIN_HTML.replace("__MSG__", ""), status_code=401)
     return await call_next(request)
+
+
+@app.get("/healthz")
+async def healthz():
+    """인증 없이 접근 가능한 상태 확인 — 컨테이너 헬스체크용."""
+    return {"ok": True, "auth": "password" if GATE_PASSWORD else "loopback-only"}
 
 
 @app.post("/login")
 async def login(request: Request):
+    ip = _peer_ip(request)
+    now = time.time()
+    # 실패 횟수 제한. 공유 패스워드 하나를 무제한으로 추측하게 두면 안 된다.
+    fails = [t for t in _login_fails.get(ip, []) if now - t < _LOGIN_WINDOW]
+    if len(fails) >= _LOGIN_MAX:
+        _login_fails[ip] = fails
+        log.warning("로그인 시도 제한 초과: %s", ip)
+        return HTMLResponse(
+            LOGIN_HTML.replace("__MSG__", "<p>시도가 너무 많다. 잠시 후 다시 시도할 것.</p>"),
+            status_code=429)
+
+    if not GATE_PASSWORD:
+        return HTMLResponse(BLOCKED_HTML, status_code=403)
+
     form = await request.form()
     if hmac.compare_digest(str(form.get("password", "")), GATE_PASSWORD):
+        _login_fails.pop(ip, None)
         token = secrets.token_urlsafe(32)
-        _sessions.add(token)
+        _prune_sessions(now)
+        _sessions[token] = now + SESSION_TTL
+        log.info("로그인 성공: %s", ip)
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie("loadgen_session", token, httponly=True, samesite="lax",
-                        max_age=86400 * 7)
+                        secure=COOKIE_SECURE, max_age=SESSION_TTL)
         return resp
-    return HTMLResponse(LOGIN_HTML, status_code=401)
+
+    fails.append(now)
+    _login_fails[ip] = fails
+    log.warning("로그인 실패: %s (%d/%d)", ip, len(fails), _LOGIN_MAX)
+    return HTMLResponse(
+        LOGIN_HTML.replace("__MSG__", "<p>패스워드가 맞지 않다.</p>"), status_code=401)
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    tok = request.cookies.get("loadgen_session", "")
+    _sessions.pop(tok, None)
+    resp = RedirectResponse("/", status_code=303)
+    resp.delete_cookie("loadgen_session")
+    return resp
 
 
 # ------------------------------------------------------------------ targets
@@ -834,8 +933,14 @@ async def enhanced_metrics(label: str, minutes: int = 10):
 
 @app.websocket("/ws")
 async def ws(sock: WebSocket):
-    if GATE_PASSWORD and sock.cookies.get("loadgen_session", "") not in _sessions:
-        await sock.close(code=4401)
+    # 미들웨어는 WebSocket 핸드셰이크를 덮지 않으므로 여기서 다시 검사한다.
+    if GATE_PASSWORD:
+        tok = sock.cookies.get("loadgen_session", "")
+        if _sessions.get(tok, 0) <= time.time():
+            await sock.close(code=4401)
+            return
+    elif (sock.client.host if sock.client else "") not in _LOOPBACK:
+        await sock.close(code=4403)
         return
     await sock.accept()
     q: asyncio.Queue = asyncio.Queue()
