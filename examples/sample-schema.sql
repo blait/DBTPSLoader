@@ -5,7 +5,7 @@
 --
 -- 도구의 판정 로직을 골고루 태우도록 구성했다:
 --   · dbo 아닌 스키마 (sales)
---   · 예약어 테이블·컬럼명 ([Order], [User], [Key])
+--   · 예약어 테이블·컬럼명 ([Order], [User], [Key], [LineNo])
 --   · FK 체인 (Account <- Order <- OrderLine)
 --   · 복합 PK (OrderLine) → 도구가 부하 대상에서 제외해야 한다
 --   · GUID PK (Session) → 같은 이유로 제외 대상
@@ -69,11 +69,11 @@ GO
 -- 상세 라인 (복합 PK → 부하 대상에서 제외되어야 한다)
 CREATE TABLE sales.OrderLine (
     OrderId  bigint        NOT NULL,
-    LineNo   int           NOT NULL,
+    [LineNo] int           NOT NULL,     -- LineNo 도 예약어다
     Sku      nvarchar(40)  NOT NULL,
     Qty      int           NOT NULL,
     Price    decimal(10,3) NOT NULL,
-    CONSTRAINT PK_OrderLine PRIMARY KEY (OrderId, LineNo),
+    CONSTRAINT PK_OrderLine PRIMARY KEY (OrderId, [LineNo]),
     CONSTRAINT FK_OrderLine_Order FOREIGN KEY (OrderId) REFERENCES sales.[Order](Id)
 );
 GO
