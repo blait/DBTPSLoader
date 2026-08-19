@@ -1,0 +1,41 @@
+# 비교 쌍 설정
+#
+# 이 파일을 복사해 comparisons.local.yaml 로 두면 그쪽이 우선 적용된다
+# (.gitignore 대상이므로 실제 엔드포인트를 커밋할 위험이 없다).
+#
+# vcpu 를 반드시 적을 것 — CPU% 는 "가용 vCPU 에 대한 비율"이라 vCPU 수가 다른
+# 두 인스턴스에서 같은 단위가 아니다. 이 값으로 정규화하지 않으면 원값 비교가
+# 결론을 뒤집는다. 리포트는 AWS RDS 에 접근할 수 있으면 실제 ProcessorFeatures
+# 와 대조해 불일치를 경고한다.
+
+pairs:
+  - name: "예시 — 인스턴스 A/B 비교"
+    a:
+      label: inst-a        # /api/targets 에 등록한 label 과 정확히 일치해야 한다
+      vcpu: 32
+    b:
+      label: inst-b
+      vcpu: 16
+    workload: draft        # workloads/<name>.json
+    # TPS 레벨. 양쪽이 모두 여유롭게 달성하는 구간에서 고를 것 —
+    # 한쪽이 목표에 미달하면 "같은 TPS" 전제가 깨지고, 미달한 쪽이 CPU를 덜 써서
+    # 오히려 유리해 보인다.
+    tps: [500, 1000, 2000]
+    note: "대상 워크로드의 실측 처리량을 감싸도록 레벨을 정할 것"
+
+# 유효성 게이트. 이 기준을 못 넘긴 레벨은 리포트에서 이유와 함께 제외된다.
+gates:
+  hit_min_pct: 95.0   # 목표 TPS 달성률 하한
+  err_max_pct: 1.0    # 에러율 상한. 실패한 트랜잭션은 CPU를 덜 쓰면서
+                      # 레이턴시를 부풀리므로 어느 방향으로도 쓸 수 없다.
+
+cpu:
+  # rds_em : RDS Enhanced Monitoring (5초 granularity). AWS 자격증명 필요.
+  # manual : 사용자가 런별 CPU%를 직접 입력.
+  # none   : CPU 비교 없이 처리량·레이턴시만.
+  source: rds_em
+
+  # max  : 부하 구간의 피크 5초 지점. 사이징은 피크가 정하고, 평균은 짧은
+  #        스파이크를 지운다.
+  # mean : 부하 구간 평균.
+  basis: max

@@ -1,0 +1,252 @@
+"""라이브 DB에서 스키마를 읽는다.
+
+이 도구는 스키마 파일을 받지 않는다. 사용자가 준비한 DB에 붙어 `sys.*` 카탈로그를
+직접 조회하고, 그 결과로 시딩 플랜과 트랜잭션 믹스를 만든다.
+
+권한이 부족해 조회가 비는 경우와 테이블이 실제로 없는 경우를 구분해 보고한다 —
+둘을 뭉치면 "빈 DB"로 오인해 엉뚱한 플랜을 만든다.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+from ..config import TargetDB
+from ..db import connect
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Column:
+    name: str
+    type: str
+    max_length: int
+    precision: int
+    scale: int
+    nullable: bool
+    identity: bool
+    computed: bool
+    default: str | None = None
+
+    @property
+    def insertable(self) -> bool:
+        """INSERT 컬럼 목록에 넣을 수 있는가."""
+        return not self.identity and not self.computed and \
+            self.type not in ("timestamp", "rowversion")
+
+
+@dataclass
+class ForeignKey:
+    name: str
+    columns: list[str]
+    ref_table: str
+    ref_columns: list[str]
+
+
+@dataclass
+class Index:
+    name: str
+    columns: list[str]
+    included: list[str]
+    unique: bool
+    primary_key: bool
+
+
+@dataclass
+class Table:
+    database: str
+    schema: str
+    name: str
+    columns: list[Column] = field(default_factory=list)
+    primary_key: list[str] = field(default_factory=list)
+    foreign_keys: list[ForeignKey] = field(default_factory=list)
+    indexes: list[Index] = field(default_factory=list)
+    row_count: int = 0
+    has_trigger: bool = False
+    has_check: bool = False
+
+    @property
+    def qualified(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def single_pk(self) -> str | None:
+        """단일 컬럼 PK 이름. 복합이거나 없으면 None."""
+        return self.primary_key[0] if len(self.primary_key) == 1 else None
+
+    @property
+    def identity_pk(self) -> str | None:
+        """IDENTITY인 단일 PK — append-only 판정과 id 범위의 기준."""
+        pk = self.single_pk
+        if not pk:
+            return None
+        col = next((c for c in self.columns if c.name == pk), None)
+        return pk if col and col.identity else None
+
+
+# --------------------------------------------------------------------- 조회 SQL
+
+_Q_TABLES = """
+SELECT s.name, t.name,
+       (SELECT SUM(p.rows) FROM sys.partitions p
+        WHERE p.object_id = t.object_id AND p.index_id IN (0, 1)),
+       (SELECT COUNT(*) FROM sys.triggers tr WHERE tr.parent_id = t.object_id),
+       (SELECT COUNT(*) FROM sys.check_constraints cc WHERE cc.parent_object_id = t.object_id)
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE t.is_ms_shipped = 0
+ORDER BY s.name, t.name
+"""
+
+_Q_COLUMNS = """
+SELECT s.name, t.name, c.name, ty.name, c.max_length, c.precision, c.scale,
+       c.is_nullable, c.is_identity, c.is_computed, dc.definition
+FROM sys.columns c
+JOIN sys.tables t ON t.object_id = c.object_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
+WHERE t.is_ms_shipped = 0
+ORDER BY s.name, t.name, c.column_id
+"""
+
+_Q_INDEXES = """
+SELECT s.name, t.name, i.name, i.is_unique, i.is_primary_key,
+       c.name, ic.is_included_column, ic.key_ordinal
+FROM sys.indexes i
+JOIN sys.tables t ON t.object_id = i.object_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE t.is_ms_shipped = 0 AND i.type > 0
+ORDER BY s.name, t.name, i.name, ic.is_included_column, ic.key_ordinal
+"""
+
+_Q_FKS = """
+SELECT s.name, t.name, fk.name, pc.name, rs.name + '.' + rt.name, rc.name, fkc.constraint_column_id
+FROM sys.foreign_keys fk
+JOIN sys.tables t ON t.object_id = fk.parent_object_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id
+                   AND pc.column_id = fkc.parent_column_id
+JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id
+                   AND rc.column_id = fkc.referenced_column_id
+ORDER BY s.name, t.name, fk.name, fkc.constraint_column_id
+"""
+
+
+def introspect(target: TargetDB, database: str) -> dict[str, Table]:
+    """{"schema.table": Table} — 한 데이터베이스의 전체 스키마.
+
+    조회는 4번의 왕복으로 끝낸다 (테이블·컬럼·인덱스·FK). 테이블마다 질의하면
+    200개 테이블에서 800번이 되므로, 전체를 한 번에 읽어 파이썬에서 묶는다.
+    """
+    tables: dict[str, Table] = {}
+    with connect(target, database, autocommit=True) as conn:
+        cur = conn.cursor()
+
+        cur.execute(_Q_TABLES)
+        for sch, name, rows, trig, chk in cur.fetchall():
+            tables[f"{sch}.{name}"] = Table(
+                database=database, schema=sch, name=name,
+                row_count=int(rows or 0), has_trigger=bool(trig), has_check=bool(chk))
+
+        cur.execute(_Q_COLUMNS)
+        for sch, tname, cname, ctype, mlen, prec, scale, nul, ident, comp, dflt in cur.fetchall():
+            t = tables.get(f"{sch}.{tname}")
+            if t is None:
+                continue
+            t.columns.append(Column(
+                name=cname, type=ctype, max_length=mlen, precision=prec, scale=scale,
+                nullable=bool(nul), identity=bool(ident), computed=bool(comp),
+                default=dflt))
+
+        cur.execute(_Q_INDEXES)
+        idx_acc: dict[tuple[str, str], Index] = {}
+        for sch, tname, iname, uniq, is_pk, cname, included, _ord in cur.fetchall():
+            key = (f"{sch}.{tname}", iname)
+            ix = idx_acc.get(key)
+            if ix is None:
+                ix = idx_acc[key] = Index(name=iname, columns=[], included=[],
+                                          unique=bool(uniq), primary_key=bool(is_pk))
+            (ix.included if included else ix.columns).append(cname)
+        for (tkey, _), ix in idx_acc.items():
+            t = tables.get(tkey)
+            if t is None:
+                continue
+            t.indexes.append(ix)
+            if ix.primary_key:
+                t.primary_key = list(ix.columns)
+
+        cur.execute(_Q_FKS)
+        fk_acc: dict[tuple[str, str], ForeignKey] = {}
+        for sch, tname, fkname, col, ref_t, ref_c, _ord in cur.fetchall():
+            key = (f"{sch}.{tname}", fkname)
+            fk = fk_acc.get(key)
+            if fk is None:
+                fk = fk_acc[key] = ForeignKey(name=fkname, columns=[],
+                                              ref_table=ref_t, ref_columns=[])
+            fk.columns.append(col)
+            fk.ref_columns.append(ref_c)
+        for (tkey, _), fk in fk_acc.items():
+            t = tables.get(tkey)
+            if t is not None:
+                t.foreign_keys.append(fk)
+
+    return tables
+
+
+def to_dict(tables: dict[str, Table]) -> dict:
+    """UI/JSON용 직렬화."""
+    return {
+        "tables": [
+            {
+                "database": t.database, "schema": t.schema, "name": t.name,
+                "qualified": t.qualified, "row_count": t.row_count,
+                "primary_key": t.primary_key,
+                "identity_pk": t.identity_pk,
+                "has_trigger": t.has_trigger, "has_check": t.has_check,
+                "columns": [
+                    {"name": c.name, "type": c.type, "max_length": c.max_length,
+                     "nullable": c.nullable, "identity": c.identity,
+                     "computed": c.computed, "insertable": c.insertable,
+                     "has_default": c.default is not None}
+                    for c in t.columns
+                ],
+                "foreign_keys": [
+                    {"name": fk.name, "columns": fk.columns,
+                     "ref_table": fk.ref_table, "ref_columns": fk.ref_columns}
+                    for fk in t.foreign_keys
+                ],
+                "indexes": [
+                    {"name": ix.name, "columns": ix.columns, "included": ix.included,
+                     "unique": ix.unique, "primary_key": ix.primary_key}
+                    for ix in t.indexes
+                ],
+            }
+            for t in sorted(tables.values(), key=lambda x: x.qualified)
+        ],
+    }
+
+
+def fingerprint(tables: dict[str, Table]) -> dict[str, tuple]:
+    """비교용 지문 — 두 인스턴스의 스키마가 같은지 판정할 때 쓴다.
+
+    행수는 일부러 제외한다. 시딩 전이라 양쪽 다 0이고, 시딩 후에는 다를 수 있는데
+    그건 스키마 문제가 아니라 데이터 문제(`schema.verify`가 따로 본다)다.
+    """
+    return {
+        key: (
+            tuple(sorted((c.name, c.type, c.max_length, c.nullable,
+                          c.identity, c.computed) for c in t.columns)),
+            tuple(t.primary_key),
+            tuple(sorted((fk.ref_table, tuple(fk.columns)) for fk in t.foreign_keys)),
+            tuple(sorted((tuple(ix.columns), tuple(ix.included), ix.unique)
+                         for ix in t.indexes)),
+        )
+        for key, t in tables.items()
+    }

@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>MSSQL HT PoC — Load Generator</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1419; --panel:#1a2129; --border:#2c3742; --fg:#d8dee6; --accent:#4da3ff; --ok:#3fb96c; --err:#e5534b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system, "SF Pro", "Segoe UI", sans-serif; }
+  header { padding:14px 24px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:16px; }
+  header h1 { font-size:16px; margin:0; }
+  #conn-dot { width:10px; height:10px; border-radius:50%; background:var(--err); }
+  #conn-dot.on { background:var(--ok); }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:16px; padding:16px 24px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .panel h2 { font-size:13px; margin:0 0 12px; text-transform:uppercase; letter-spacing:.08em; color:#8a97a5; }
+  label { display:block; font-size:12px; color:#8a97a5; margin:8px 0 2px; }
+  input, select { width:100%; background:#0d1116; color:var(--fg); border:1px solid var(--border); border-radius:5px; padding:6px 8px; font-size:13px; }
+  input[type=range] { padding:0; }
+  .row { display:flex; gap:8px; } .row > div { flex:1; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:5px; padding:8px 14px; font-size:13px; cursor:pointer; margin-top:10px; }
+  button.secondary { background:#2c3742; }
+  button.danger { background:var(--err); }
+  button:disabled { opacity:.45; cursor:default; }
+  .stat-grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin-bottom:12px; }
+  .stat { background:#0d1116; border:1px solid var(--border); border-radius:6px; padding:10px; text-align:center; }
+  .stat .v { font-size:22px; font-weight:600; color:var(--accent); }
+  .stat .k { font-size:11px; color:#8a97a5; }
+  .chart-wrap { height:220px; margin-bottom:14px; }
+  progress { width:100%; height:8px; }
+  #seed-tables { max-height:180px; overflow-y:auto; font-size:12px; }
+  #seed-tables div { display:flex; justify-content:space-between; padding:1px 0; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
+  th { color:#8a97a5; font-weight:500; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; background:#2c3742; }
+  .run-row:hover td { background:#1e2830; }
+  .tab-btn { margin:0; padding:7px 18px; background:transparent; color:#8a97a5; border:1px solid transparent; border-radius:6px; font-size:13px; }
+  .tab-btn:hover { color:var(--fg); }
+  .tab-btn.active { background:var(--panel); color:var(--fg); border-color:var(--border); }
+  .tab { display:none; }
+  .tab.active { display:block; }
+  .cmp-a { color:#4da3ff; } .cmp-b { color:#e0a336; }
+  .delta-good { color:var(--ok); } .delta-bad { color:var(--err); }
+  .badge.running { background:var(--ok); color:#06130a; }
+  #rw-val, #tps-val { color:var(--accent); font-weight:600; }
+  a { color: var(--accent); }
+  .chips { display:flex; gap:5px; flex-wrap:wrap; }
+  .chip { margin:0; padding:4px 10px; font-size:12px; background:#0d1116; border:1px solid var(--border); color:#8a97a5; }
+  .chip.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .hint { font-size:11px; color:#5c6773; line-height:1.5; }
+  .warn { font-size:11px; color:#e0a336; }
+  .callout { padding:10px 14px; border-radius:6px; font-size:12.5px; margin-bottom:14px; border:1px solid var(--border); background:#0d1116; }
+  .callout.warn { border-color:#e0a336; background:#2a2213; color:var(--fg); font-size:12.5px; }
+  .callout.bad { border-color:var(--err); background:#2a1614; color:var(--fg); }
+  .callout.good { border-color:var(--ok); background:#12291a; color:var(--fg); }
+  .invalid td { color:#7d8894; }
+  .kpi { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin-bottom:14px; }
+  .kpi .stat .v { font-size:19px; }
+  ul.tight { margin:4px 0 12px; padding-left:20px; font-size:12.5px; }
+  ul.tight li { margin:3px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MSSQL HT PoC — Load Generator</h1>
+  <span id="conn-dot" title="websocket"></span>
+  <span id="run-badge" class="badge">idle</span>
+  <nav style="margin-left:auto; display:flex; gap:4px;">
+    <button class="tab-btn active" data-tab="live" onclick="showTab('live')">Live Metrics</button>
+    <button class="tab-btn" data-tab="history" onclick="showTab('history')">Run History</button>
+  </nav>
+</header>
+<main>
+  <!-- ======================= left: controls ======================= -->
+  <div>
+    <div class="panel">
+      <h2>Target (RDS 인스턴스)</h2>
+      <div id="t-list" style="font-size:12px; margin-bottom:8px;"></div>
+      <div id="t-result" style="font-size:12px; margin-bottom:8px; color:#8a97a5;"></div>
+      <details>
+      <summary style="font-size:12px; color:#8a97a5; cursor:pointer;">새 타겟 직접 등록</summary>
+      <label>Label</label><input id="t-label" placeholder="r6i-ht-on / r7i-ht-off / local">
+      <label>Host</label><input id="t-host" placeholder="xxx.rds.amazonaws.com 또는 localhost">
+      <div class="row">
+        <div><label>Port</label><input id="t-port" type="number" value="1433"></div>
+        <div><label>User</label><input id="t-user" value="sa"></div>
+      </div>
+      <label>Password</label><input id="t-pass" type="password">
+      <button onclick="addTarget()">등록</button>
+      </details>
+    </div>
+
+
+    <div class="panel">
+      <h2>1. Schema (대상 스키마 조회)</h2>
+      <div class="hint" style="margin-bottom:6px;">
+        스키마만 있고 데이터는 빈 DB를 미리 준비해 둘 것 — DB 생성과 스키마 적용은
+        이 도구가 하지 않는다.
+      </div>
+      <label>Target</label><select id="sc-target"></select>
+      <label>Databases <span class="hint">— 비우면 서버의 사용자 DB 전체</span></label>
+      <input id="sc-dbs" placeholder="예: Sales,Sales_Audit">
+      <button onclick="loadSchema()" id="sc-btn">조회</button>
+      <div id="sc-result" style="margin-top:8px; font-size:12px;"></div>
+      <div id="sc-tables" style="max-height:220px; overflow:auto; margin-top:6px;"></div>
+    </div>
+
+    <div class="panel">
+      <h2>2. Seed Plan (시딩 플랜)</h2>
+      <div class="row">
+        <div><label>전체 목표 행수</label><input id="p-total" type="number" value="1000000" step="100000" min="1000"></div>
+        <div><label>플랜 이름</label><input id="p-name" value="draft"></div>
+      </div>
+      <div class="hint">테이블별 행수는 스키마 구조로 추정한다 (추천값 — 아래 표에서 수정 가능).</div>
+      <button onclick="draftPlan()" id="p-btn">플랜 초안 생성</button>
+      <div id="p-warn" style="margin-top:6px; font-size:12px;"></div>
+      <div id="p-tables" style="max-height:300px; overflow:auto; margin-top:6px;"></div>
+      <div class="row" style="margin-top:6px;">
+        <div><label>Workers</label><input id="s-workers" type="number" value="4"></div>
+        <div><label>Batch</label><input id="s-batch" type="number" value="5000"></div>
+      </div>
+      <div class="row">
+        <button onclick="savePlan()" class="secondary" id="p-save">플랜 저장</button>
+        <button onclick="startSeed()" id="seed-btn">시딩 시작</button>
+      </div>
+      <div id="seed-phase" style="margin-top:8px; font-size:12px;"></div>
+      <div id="seed-tables"></div>
+      <details style="margin-top:8px;">
+        <summary class="hint">시딩 후 양쪽 데이터 대조</summary>
+        <div class="row" style="margin-top:6px;">
+          <div><label>A</label><select id="v-a"></select></div>
+          <div><label>B</label><select id="v-b"></select></div>
+        </div>
+        <button onclick="verifySeed()" class="secondary">대조 실행</button>
+        <div id="v-result" style="margin-top:6px; font-size:12px;"></div>
+      </details>
+    </div>
+
+    <div class="panel">
+      <h2>3. Workload (트랜잭션 믹스)</h2>
+      <div class="row">
+        <div><label>워크로드 이름</label><input id="w-name" value="draft"></div>
+        <div><label>대상 테이블 수</label><input id="w-max" type="number" value="12" min="1" max="60"></div>
+      </div>
+      <div class="hint">스키마의 PK·FK·인덱스로 초안을 만든다. 실제 쿼리 패턴은 스키마만으로
+        알 수 없으므로 <b>반드시 검토</b>할 것.</div>
+      <button onclick="draftWorkload()" id="w-btn">믹스 초안 생성</button>
+      <div id="w-warn" style="margin-top:6px; font-size:12px;"></div>
+      <div id="w-txns" style="max-height:300px; overflow:auto; margin-top:6px;"></div>
+      <button onclick="saveWorkload()" class="secondary" id="w-save" style="margin-top:6px;">워크로드 저장</button>
+    </div>
+
+    <div class="panel">
+      <h2>Run (부하 실행) — TPS 기준</h2>
+
+      <label>래더 프리셋 (측정에 쓴 설정 그대로)</label>
+      <div id="r-presets" class="chips" style="margin-bottom:2px;"></div>
+      <div id="r-preset-why" class="hint" style="margin-bottom:6px;"></div>
+
+      <label>Target</label><select id="r-target"></select>
+
+      <label style="margin-top:10px;">목표 TPS <span class="hint">— 양쪽 인스턴스에 같은 값을 걸어야 비교가 성립한다</span></label>
+      <div class="row" style="align-items:center;">
+        <div style="flex:0 0 110px;"><input id="r-tps" type="number" min="10" step="10" value="3000" onchange="tpsChanged(this.value)"></div>
+        <div id="r-tps-levels" class="chips"></div>
+      </div>
+
+      <div class="row">
+        <div><label>Workload</label><select id="r-workload"></select></div>
+        <div><label>Mode</label><select id="r-mode" onchange="modeChanged()">
+          <option value="open">open (목표 TPS 고정)</option>
+          <option value="closed">closed (최대 처리량)</option>
+        </select></div>
+      </div>
+      <div class="row">
+        <div><label>Duration (s)</label><input id="r-duration" type="number" value="180"></div>
+        <div><label>Warmup (s)</label><input id="r-warmup" type="number" value="30"></div>
+      </div>
+      <div class="row">
+        <div><label>Processes</label><input id="r-procs" type="number" value="24" onchange="connsChanged()"></div>
+        <div><label>Threads/proc</label><input id="r-threads" type="number" value="16" onchange="connsChanged()"></div>
+      </div>
+      <div class="hint" id="r-conns">커넥션 상한 384</div>
+      <div class="hint" style="margin-top:6px;">부하 파라미터의 id 범위는 대상 DB의
+        MAX(id)에서 자동으로 읽는다 — 시딩이 되어 있어야 한다.</div>
+      <label>Read <span id="rw-val">9</span>% / Write <span id="rw-val2">91</span>%</label>
+      <input id="r-rw" type="range" min="0" max="100" value="9" oninput="rwChanged(this.value)">
+      <div class="hint" id="r-rw-warn"></div>
+      <label style="margin-top:6px;">Note (리포트 페어링 태그)</label>
+      <input id="r-note" placeholder="iso-TPS ladder p7 L3000">
+      <div class="hint">같은 note 배치 + 같은 설정끼리만 리포트에서 짝을 맺는다.</div>
+      <div class="row">
+        <button onclick="startRun()" id="run-btn">시작</button>
+        <button class="danger" onclick="stopRun()">정지</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================= right: tabs ======================= -->
+  <div>
+    <!-- ---------- tab: live ---------- -->
+    <div class="tab active" id="tab-live">
+    <div class="panel">
+      <h2>Live Metrics <span id="live-run-id" style="text-transform:none; color:#5c6773;"></span></h2>
+      <div id="run-progress" style="display:none; margin-bottom:12px;">
+        <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+          <span id="rp-phase" style="font-weight:600;"></span>
+          <span id="rp-time" style="color:#8a97a5;"></span>
+        </div>
+        <div style="background:#0d1116; border:1px solid var(--border); border-radius:6px; height:14px; overflow:hidden;">
+          <div id="rp-bar" style="height:100%; width:0%; background:var(--accent); transition:width .5s;"></div>
+        </div>
+      </div>
+      <div id="run-done" style="display:none; margin-bottom:12px; padding:10px 14px; border-radius:6px; background:#12291a; border:1px solid var(--ok); font-size:13px;"></div>
+      <div class="stat-grid">
+        <div class="stat"><div class="v" id="m-tps">–</div><div class="k">TPS</div></div>
+        <div class="stat"><div class="v" id="m-p50">–</div><div class="k">p50 ms</div></div>
+        <div class="stat"><div class="v" id="m-p99">–</div><div class="k">p99 ms</div></div>
+        <div class="stat"><div class="v" id="m-err">–</div><div class="k">errors/s</div></div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-tps"></canvas></div>
+      <div class="chart-wrap"><canvas id="chart-lat"></canvas></div>
+      <h2 style="margin-top:16px;">RDS 서버 지표 <span id="cw-db" style="text-transform:none; color:#5c6773;"></span>
+        <span style="font-weight:400; font-size:11px; color:#5c6773;">5초 단위 (Enhanced Monitoring)</span></h2>
+      <div class="stat-grid" style="grid-template-columns:repeat(6, 1fr);">
+        <div class="stat"><div class="v" id="em-cpu">–</div><div class="k">CPU %</div></div>
+        <div class="stat"><div class="v" id="em-iops">–</div><div class="k">disk IOPS r/w</div></div>
+        <div class="stat"><div class="v" id="em-mbps">–</div><div class="k">disk MB/s r/w</div></div>
+        <div class="stat"><div class="v" id="em-net">–</div><div class="k">net MB/s</div></div>
+        <div class="stat"><div class="v" id="em-sqlmem">–</div><div class="k">SQL mem GB</div></div>
+        <div class="stat"><div class="v" id="em-threads">–</div><div class="k">threads</div></div>
+      </div>
+      <div class="chart-wrap" style="height:170px;"><canvas id="chart-em"></canvas></div>
+      <div class="chart-wrap" style="height:150px; margin-top:10px;"><canvas id="chart-emio"></canvas></div>
+      <div style="font-size:11px; color:#5c6773; margin-top:-8px;">아래 connections: CloudWatch 1분 단위(1~2분 지연)</div>
+      <div class="chart-wrap" style="height:130px; margin-top:10px;"><canvas id="chart-cw"></canvas></div>
+    </div>
+    </div>
+
+    <!-- ---------- tab: history ---------- -->
+    <div class="tab" id="tab-history">
+    <div class="panel">
+      <h2>Run History</h2>
+      <table id="runs-table">
+        <thead><tr><th>Run</th><th>실행 시간</th><th>Label</th><th>Profile</th><th>Mode</th><th>R%</th><th>avg TPS</th><th>Err</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    </div>
+
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = (path, opts) => fetch(path, opts).then(async r => {
+  if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  return r.json();
+});
+
+
+// ---------------- targets ----------------
+async function addTarget() {
+  try {
+    await api('/api/targets', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:$('t-label').value, host:$('t-host').value,
+        port:+$('t-port').value, user:$('t-user').value, password:$('t-pass').value})});
+    $('t-result').textContent = '등록됨';
+    refreshTargets();
+  } catch(e) { $('t-result').textContent = '실패: ' + e.message; }
+}
+async function testTarget(label) {
+  $('t-result').textContent = label + ' 테스트 중…';
+  try {
+    const r = await api(`/api/targets/${encodeURIComponent(label)}/test`, {method:'POST'});
+    $('t-result').textContent = label + ' OK: ' + r.version.split('\n')[0];
+  } catch(e) { $('t-result').textContent = label + ' 실패: ' + e.message; }
+}
+async function refreshTargets() {
+  const ts = await api('/api/targets');
+  $('t-list').innerHTML = ts.length
+    ? ts.map(t => `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;">
+        <span><b>${t.label}</b><br><span style="color:#5c6773">${t.host}</span></span>
+        <button class="secondary" style="margin:0;padding:4px 10px;" onclick="testTarget('${t.label}')">연결 테스트</button>
+      </div>`).join('')
+    : '<span style="color:#5c6773">등록된 타겟 없음</span>';
+  for (const sel of [$('sc-target'), $('r-target'), $('v-a'), $('v-b')]) {
+    const cur = sel.value;
+    sel.innerHTML = ts.map(t => `<option>${t.label}</option>`).join('');
+    if (cur) sel.value = cur;
+  }
+  if (ts.length > 1 && !$('v-b').value) $('v-b').value = ts[1].label;
+}
+
+// ---------------- schema ----------------
+// 이 도구는 스키마를 만들지 않는다. 사용자가 준비한 빈 DB 를 조회해서
+// 시딩 플랜과 워크로드를 만든다.
+let schema = null;
+function dbsField() {
+  return $('sc-dbs').value.split(',').map(s => s.trim()).filter(Boolean);
+}
+async function loadSchema() {
+  $('sc-btn').disabled = true;
+  $('sc-result').textContent = '조회 중…';
+  try {
+    const q = dbsField().length ? '?databases=' + encodeURIComponent(dbsField().join(',')) : '';
+    schema = await api(`/api/schema/${encodeURIComponent($('sc-target').value)}${q}`);
+    const g = schema.guard;
+    // 빈 DB 가 아니면 시딩이 거부된다 — 서버가 최종 관문이지만 여기서 먼저 알린다.
+    const cls = g.ok ? 'callout good' : 'callout bad';
+    const msg = g.warning ? `⚠️ ${g.warning}`
+      : g.ok ? `✓ 빈 DB 확인 — 테이블 ${g.table_count}개`
+      : `✗ 데이터가 있는 테이블 ${g.occupied.length}개 — 시딩할 수 없다`;
+    $('sc-result').innerHTML = `<div class="${cls}">${msg}<br>
+      <span class="hint">DB: ${g.databases.join(', ') || '–'}</span></div>`;
+    const rows = [];
+    for (const db of g.databases) {
+      for (const t of (schema[db] || {tables:[]}).tables) {
+        rows.push(`<tr><td>${db}.${t.name}</td><td>${t.columns.length}</td>
+          <td>${t.primary_key.join(',') || '–'}</td><td>${t.foreign_keys.length}</td>
+          <td>${t.indexes.length}</td><td>${t.row_count.toLocaleString()}</td></tr>`);
+      }
+    }
+    $('sc-tables').innerHTML = rows.length
+      ? `<table><thead><tr><th>테이블</th><th>컬럼</th><th>PK</th><th>FK</th><th>IX</th><th>행</th></tr></thead>
+         <tbody>${rows.join('')}</tbody></table>`
+      : '<span class="hint">테이블이 없다</span>';
+  } catch(e) {
+    $('sc-result').innerHTML = `<div class="callout bad">조회 실패: ${e.message}</div>`;
+  }
+  $('sc-btn').disabled = false;
+}
+
+// ---------------- seed plan ----------------
+let plan = null;
+async function draftPlan() {
+  $('p-btn').disabled = true;
+  $('p-warn').textContent = '생성 중…';
+  try {
+    plan = await api('/api/plan/draft', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:$('sc-target').value, total_rows:+$('p-total').value,
+        databases:dbsField().length ? dbsField() : null, name:$('p-name').value})});
+    renderPlan();
+  } catch(e) { $('p-warn').innerHTML = `<div class="callout bad">실패: ${e.message}</div>`; }
+  $('p-btn').disabled = false;
+}
+function renderPlan() {
+  if (!plan) return;
+  const warned = plan.tables.filter(t => t.warnings.length);
+  $('p-warn').innerHTML =
+    `<div class="hint">계획 행수 합계 <b>${plan.total_rows_planned.toLocaleString()}</b>
+      (요청 ${plan.total_rows_requested.toLocaleString()}) · 테이블 ${plan.tables.length}개</div>` +
+    (warned.length ? `<div class="callout warn">주의 필요 ${warned.length}개 — 트리거·CHECK 제약이
+      있으면 합성값이 거부될 수 있다</div>` : '');
+  $('p-tables').innerHTML = `<table><thead><tr><th>테이블</th><th>성격</th><th>컬럼</th>
+    <th>행수 (수정 가능)</th></tr></thead><tbody>` +
+    plan.tables.map((t, i) => `<tr${t.warnings.length ? ' class="invalid"' : ''}>
+      <td title="${t.warnings.join(' / ')}">${t.database}.${t.table}${t.warnings.length ? ' ⚠️' : ''}</td>
+      <td>${t.kind}</td><td>${t.columns.length}</td>
+      <td><input type="number" value="${t.rows}" min="0" style="padding:2px 4px;"
+           onchange="plan.tables[${i}].rows=+this.value; plan.edited=true;"></td></tr>`).join('') +
+    '</tbody></table>';
+}
+async function savePlan() {
+  if (!plan) { $('p-warn').textContent = '먼저 초안을 생성할 것'; return; }
+  try {
+    const r = await api(`/api/plan/${encodeURIComponent($('p-name').value)}`,
+      {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(plan)});
+    $('p-warn').innerHTML = `<div class="callout good">저장됨 — 합계 ${r.total_rows_planned.toLocaleString()}행</div>`;
+  } catch(e) { $('p-warn').innerHTML = `<div class="callout bad">저장 실패: ${e.message}</div>`; }
+}
+
+// ---------------- seed ----------------
+async function startSeed() {
+  $('seed-btn').disabled = true;
+  $('seed-tables').innerHTML = '';
+  try {
+    await api('/api/seed', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:$('sc-target').value, plan_name:$('p-name').value,
+        workers:+$('s-workers').value, batch_size:+$('s-batch').value})});
+    $('seed-phase').textContent = '실행 중…';
+  } catch(e) { $('seed-phase').textContent = '실패: ' + e.message; $('seed-btn').disabled = false; }
+}
+async function verifySeed() {
+  $('v-result').textContent = '대조 중…';
+  try {
+    const r = await api('/api/seed/verify', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({a:$('v-a').value, b:$('v-b').value, plan_name:$('p-name').value})});
+    const cls = r.same ? 'good' : r.rows_same ? 'warn' : 'bad';
+    $('v-result').innerHTML = `<div class="callout ${cls}">${r.note}<br>
+      <span class="hint">일치 ${r.matched}개 · 행수 불일치 ${r.rows_differ.length}개 ·
+      체크섬 불일치 ${r.checksum_differ.length}개 · 조회 실패 ${r.errors.length}개</span></div>`;
+  } catch(e) { $('v-result').innerHTML = `<div class="callout bad">실패: ${e.message}</div>`; }
+}
+
+// ---------------- workload ----------------
+let workload = null;
+async function draftWorkload() {
+  $('w-btn').disabled = true;
+  $('w-warn').textContent = '생성 중…';
+  try {
+    workload = await api('/api/workload/draft', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:$('sc-target').value, name:$('w-name').value,
+        databases:dbsField().length ? dbsField() : null, max_tables:+$('w-max').value})});
+    renderWorkload();
+  } catch(e) { $('w-warn').innerHTML = `<div class="callout bad">실패: ${e.message}</div>`; }
+  $('w-btn').disabled = false;
+}
+function renderWorkload() {
+  if (!workload) return;
+  $('w-warn').innerHTML =
+    `<div class="hint">읽기 ${workload.read_count}개 · 쓰기 ${workload.write_count}개</div>` +
+    (workload.warnings || []).map(w => `<div class="callout warn">${w}</div>`).join('');
+  $('w-txns').innerHTML = `<table><thead><tr><th>이름</th><th>종류</th><th>가중치</th>
+    <th>제외</th></tr></thead><tbody>` +
+    workload.txns.map((t, i) => `<tr>
+      <td title="${(t.why || '').replace(/"/g, '')}&#10;&#10;${t.sql.join('&#10;').replace(/"/g, '')}">${t.name}</td>
+      <td class="${t.kind === 'read' ? 'cmp-a' : 'cmp-b'}">${t.kind}</td>
+      <td><input type="number" value="${t.weight}" min="0" style="padding:2px 4px;width:60px;"
+           onchange="workload.txns[${i}].weight=+this.value; workload.edited=true;"></td>
+      <td><input type="checkbox" ${t.disabled ? 'checked' : ''} style="width:auto;"
+           onchange="workload.txns[${i}].disabled=this.checked; workload.edited=true;"></td></tr>`).join('') +
+    '</tbody></table><div class="hint">이름에 마우스를 올리면 판단 근거와 SQL 을 볼 수 있다.</div>';
+}
+async function saveWorkload() {
+  if (!workload) { $('w-warn').textContent = '먼저 초안을 생성할 것'; return; }
+  try {
+    await api(`/api/workload/${encodeURIComponent($('w-name').value)}`,
+      {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(workload)});
+    $('w-warn').innerHTML = '<div class="callout good">저장됨</div>';
+    await refreshWorkloads();
+  } catch(e) { $('w-warn').innerHTML = `<div class="callout bad">저장 실패: ${e.message}</div>`; }
+}
+async function refreshWorkloads() {
+  try {
+    const names = await api('/api/workloads');
+    const sel = $('r-workload'), cur = sel.value;
+    sel.innerHTML = names.map(n => `<option>${n}</option>`).join('');
+    if (cur && names.includes(cur)) sel.value = cur;
+  } catch(e) { /* 저장된 워크로드 없음 */ }
+}
+const seedRows = {};
+function seedProgress(table, done, total) {
+  seedRows[table] = {done, total};
+  const el = $('seed-tables');
+  el.innerHTML = Object.entries(seedRows).map(([t, {done, total}]) =>
+    `<div><span>${t}</span><span>${done.toLocaleString()} / ${total.toLocaleString()}</span></div>`).join('');
+}
+
+// ---------------- run ----------------
+// 폼 기본값은 서버의 loadgen/presets.py 에서 온다 — 여섯 개 필드를 다시 입력하지
+// 않아도 UI 에서 시작한 런이 다른 런과 비교 가능해진다. 비교 쌍과 TPS 레벨은
+// comparisons.yaml 에서 읽는다.
+let presets = null, presetKey = null;
+async function loadPresets() {
+  try { presets = await api('/api/presets'); } catch(e) { return; }
+  const pairs = presets.pairs || [];
+  $('r-presets').innerHTML = pairs.length
+    ? pairs.map((p, i) =>
+        `<button class="chip" id="pchip-${i}" onclick="applyPreset(${i})">${p.name}</button>`).join('')
+    : '<span class="hint">comparisons.yaml 에 비교 쌍이 없다 — 아래 값을 직접 입력한다.</span>';
+  applyDefaults();
+  if (pairs.length) applyPreset(0);
+}
+function applyDefaults() {
+  const d = presets.defaults;
+  $('r-mode').value = d.mode;
+  $('r-duration').value = d.duration_sec;
+  $('r-warmup').value = d.warmup_sec;
+  $('r-procs').value = d.processes;
+  $('r-threads').value = d.threads_per_process;
+  $('r-tps').value = d.target_tps;
+  $('r-rw').value = d.read_pct; rwChanged(d.read_pct);
+  connsChanged(); modeChanged();
+}
+function applyPreset(i) {
+  const p = (presets.pairs || [])[i];
+  if (!p) return;
+  presetKey = p.name;
+  document.querySelectorAll('#r-presets .chip').forEach(b => b.classList.toggle('on', b.id === `pchip-${i}`));
+  $('r-preset-why').textContent = p.note || '';
+  if (p.workload) {
+    const opt = [...$('r-workload').options].find(o => o.value === p.workload);
+    if (opt) $('r-workload').value = p.workload;
+  }
+  // 이 쌍의 한쪽이 등록돼 있으면 그것을 고른다.
+  const t = [...$('r-target').options].find(o => o.value === p.a_label || o.value === p.b_label);
+  if (t) $('r-target').value = t.value;
+  $('r-tps-levels').innerHTML = (p.tps || []).map(v =>
+    `<button class="chip" id="tchip-${v}" onclick="setTps(${v})">${v.toLocaleString()}</button>`).join('');
+  if (p.tps && p.tps.length) setTps(p.tps[0]);
+  connsChanged(); modeChanged();
+}
+function setTps(v) {
+  $('r-tps').value = v;
+  tpsChanged(v);
+}
+function rwChanged(v) {
+  $('rw-val').textContent = v; $('rw-val2').textContent = 100 - v;
+  const def = presets ? presets.defaults.read_pct : 50;
+  $('r-rw-warn').className = +v !== def ? 'warn' : 'hint';
+  $('r-rw-warn').textContent = +v !== def
+    ? `⚠️ 기본값(read ${def}%)과 다르다. read/write 비율이 다르면 다른 워크로드를 재는 것이므로 다른 비율로 측정한 런과 비교할 수 없다.`
+    : `기본 비율 (read ${def}% / write ${100-def}%). 대상 워크로드의 실측 비율로 맞출 것.`;
+  if (running) api('/api/run/update', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({read_pct: +v})}).catch(()=>{});
+}
+function tpsChanged(v) {
+  document.querySelectorAll('#r-tps-levels .chip').forEach(b => b.classList.toggle('on', b.id === `tchip-${+v}`));
+  if (presetKey) $('r-note').placeholder = `ladder ${presetKey} L${+v}`;
+  if (running) api('/api/run/update', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({target_tps: +v})}).catch(()=>{});
+}
+function connsChanged() {
+  $('r-conns').textContent = `커넥션 상한 ${(+$('r-procs').value * +$('r-threads').value).toLocaleString()}`;
+}
+function modeChanged() {
+  const open = $('r-mode').value === 'open';
+  $('r-tps').disabled = !open;
+  $('r-tps-levels').style.opacity = open ? '1' : '.4';
+  $('r-tps-levels').style.pointerEvents = open ? '' : 'none';
+}
+let running = false;
+let runPlan = null;  // {startedAt, warmup, duration, runId}
+async function startRun() {
+  resetCharts();
+  const openMode = $('r-mode').value === 'open';
+  try {
+    const r = await api('/api/run', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:$('r-target').value, workload_name:$('r-workload').value,
+        mode:$('r-mode').value, duration_sec:+$('r-duration').value, warmup_sec:+$('r-warmup').value,
+        processes:+$('r-procs').value, threads_per_process:+$('r-threads').value,
+        target_tps: openMode ? +$('r-tps').value : null,
+        read_pct:+$('r-rw').value,
+        // The report only pairs runs sharing a note batch tag, so default it to
+        // the preset's tag rather than leaving it blank.
+        note: $('r-note').value || (openMode && presetKey ? $('r-note').placeholder : '')})});
+    running = true;
+    runPlan = {startedAt: Date.now()/1000, warmup: +$('r-warmup').value,
+               duration: +$('r-duration').value, runId: r.run_id};
+    $('run-badge').textContent = 'running'; $('run-badge').className = 'badge running';
+    $('run-btn').disabled = true;
+    $('live-run-id').textContent = r.run_id;
+    $('run-done').style.display = 'none';
+    $('run-progress').style.display = 'block';
+    progressTimer = setInterval(updateProgress, 500);
+    updateProgress();
+    cwTarget = $('r-target').value;
+    setTimeout(pollCloudwatch, 1000);
+    setTimeout(pollEnhanced, 1000);
+  } catch(e) { alert('시작 실패: ' + e.message); }
+}
+async function stopRun() { await api('/api/run/stop', {method:'POST'}).catch(()=>{}); }
+
+let progressTimer = null;
+function updateProgress() {
+  if (!runPlan) return;
+  const elapsed = Date.now()/1000 - runPlan.startedAt;
+  const total = runPlan.warmup + runPlan.duration;
+  const fmt = s => `${Math.floor(s/60)}:${String(Math.max(0, Math.floor(s%60))).padStart(2,'0')}`;
+  if (elapsed < runPlan.warmup) {
+    $('rp-phase').textContent = `워밍업 중 (통계 제외 구간)`;
+    $('rp-bar').style.background = '#e0a336';
+  } else {
+    $('rp-phase').textContent = `측정 중`;
+    $('rp-bar').style.background = 'var(--accent)';
+  }
+  $('rp-time').textContent = `${fmt(elapsed)} / ${fmt(total)} — 남은 시간 ${fmt(total - elapsed)}`;
+  $('rp-bar').style.width = Math.min(100, elapsed/total*100) + '%';
+  if (elapsed >= total) $('rp-phase').textContent = '마무리 중 (워커 정리·결과 저장)…';
+}
+async function onRunFinished(status) {
+  clearInterval(progressTimer); progressTimer = null;
+  $('run-progress').style.display = 'none';
+  $('run-btn').disabled = false;
+  if (!runPlan) return;
+  try {
+    const d = await api(`/api/runs/${runPlan.runId}`);
+    const s = d.summary || {};
+    $('run-done').innerHTML = `✅ <b>런 완료</b> — ${runPlan.runId}<br>
+      평균 <b>${(s.avg_tps??0).toLocaleString()} TPS</b> ·
+      총 ${(s.total_txns??0).toLocaleString()} 트랜잭션 ·
+      에러 <b style="color:${s.total_errors? 'var(--err)':'inherit'}">${s.total_errors??0}</b> ·
+      측정 ${s.steady_seconds??0}s
+      &nbsp; <a href="/api/runs/${runPlan.runId}" target="_blank">상세 JSON</a>`;
+  } catch(e) {
+    $('run-done').innerHTML = `런 종료 (${status}) — ${runPlan.runId}`;
+  }
+  $('run-done').style.display = 'block';
+  runPlan = null;
+}
+
+// ---------------- charts ----------------
+const mkChart = (canvas, datasets, yTitle) => new Chart(canvas, {
+  type: 'line',
+  data: { labels: [], datasets },
+  options: {
+    animation: false, responsive: true, maintainAspectRatio: false,
+    scales: {
+      x: { ticks: { color:'#5c6773', maxTicksLimit: 10 }, grid: { color:'#1e2830' } },
+      y: { beginAtZero: true, title:{display:true, text:yTitle, color:'#8a97a5'},
+           ticks: { color:'#5c6773' }, grid: { color:'#1e2830' } },
+    },
+    plugins: { legend: { labels: { color:'#8a97a5', boxWidth: 12 } } },
+  }
+});
+const tpsChart = mkChart($('chart-tps'),
+  [{label:'TPS', data:[], borderColor:'#4da3ff', pointRadius:0, borderWidth:2},
+   {label:'errors', data:[], borderColor:'#e5534b', pointRadius:0, borderWidth:1}], 'txn/s');
+const latChart = mkChart($('chart-lat'),
+  [{label:'p50', data:[], borderColor:'#3fb96c', pointRadius:0, borderWidth:2},
+   {label:'p95', data:[], borderColor:'#e0a336', pointRadius:0, borderWidth:2},
+   {label:'p99', data:[], borderColor:'#e5534b', pointRadius:0, borderWidth:2}], 'ms');
+function resetCharts() {
+  for (const c of [tpsChart, latChart]) { c.data.labels = []; c.data.datasets.forEach(d => d.data = []); c.update(); }
+}
+function addPoint(p) {
+  const t = new Date(p.ts * 1000).toLocaleTimeString();
+  const push = (c, vals) => {
+    c.data.labels.push(t);
+    vals.forEach((v, i) => c.data.datasets[i].data.push(v));
+    if (c.data.labels.length > 300) { c.data.labels.shift(); c.data.datasets.forEach(d => d.data.shift()); }
+    c.update('none');
+  };
+  push(tpsChart, [p.tps, p.errors]);
+  push(latChart, [p.p50, p.p95, p.p99]);
+  $('m-tps').textContent = p.tps.toLocaleString();
+  $('m-p50').textContent = p.p50.toFixed(1);
+  $('m-p99').textContent = p.p99.toFixed(1);
+  $('m-err').textContent = p.errors;
+}
+
+// ---------------- cloudwatch ----------------
+const cwChart = mkChart($('chart-cw'),
+  [{label:'connections', data:[], borderColor:'#3fb96c', pointRadius:0, borderWidth:2}], 'connections');
+const emChart = mkChart($('chart-em'),
+  [{label:'CPU total %', data:[], borderColor:'#4da3ff', backgroundColor:'rgba(77,163,255,.15)', fill:true, pointRadius:0, borderWidth:2},
+   {label:'user %', data:[], borderColor:'#3fb96c', pointRadius:0, borderWidth:1},
+   {label:'kernel %', data:[], borderColor:'#e0a336', pointRadius:0, borderWidth:1}], 'CPU % (5s)');
+emChart.options.scales.y.max = 100;
+const emioChart = mkChart($('chart-emio'),
+  [{label:'read IOPS', data:[], borderColor:'#4da3ff', pointRadius:0, borderWidth:1.5, yAxisID:'y'},
+   {label:'write IOPS', data:[], borderColor:'#e0a336', pointRadius:0, borderWidth:1.5, yAxisID:'y'},
+   {label:'disk MB/s', data:[], borderColor:'#3fb96c', pointRadius:0, borderWidth:1.5, yAxisID:'y1'}], 'IOPS (5s)');
+emioChart.options.scales.y1 = {position:'right', beginAtZero:true, title:{display:true, text:'MB/s', color:'#8a97a5'}, ticks:{color:'#5c6773'}, grid:{drawOnChartArea:false}};
+let cwTarget = null;  // label being watched
+async function pollCloudwatch() {
+  const label = running && runPlan ? $('r-target').value : cwTarget;
+  if (!label) return;
+  try {
+    const d = await api(`/api/cloudwatch/${encodeURIComponent(label)}?minutes=30`);
+    if (!d.points.length) return;
+    cwChart.data.labels = d.points.map(p => new Date(p.ts*1000).toLocaleTimeString());
+    cwChart.data.datasets[0].data = d.points.map(p => p.conns);
+    cwChart.update('none');
+  } catch(e) { /* target may be non-RDS */ }
+}
+setInterval(pollCloudwatch, 30000);
+async function pollEnhanced() {
+  const label = running && runPlan ? $('r-target').value : cwTarget;
+  if (!label) return;
+  try {
+    const d = await api(`/api/enhanced/${encodeURIComponent(label)}?minutes=10`);
+    if (!d.points.length) return;
+    $('cw-db').textContent = d.db_id || label;
+    const last = d.points[d.points.length - 1];
+    $('em-cpu').textContent = last.cpu_total.toFixed(1);
+    $('em-iops').textContent = `${Math.round(last.disk_riops)}/${Math.round(last.disk_wiops)}`;
+    $('em-mbps').textContent = `${last.disk_rmbps.toFixed(0)}/${last.disk_wmbps.toFixed(0)}`;
+    $('em-net').textContent = last.net_mbps.toFixed(1);
+    $('em-sqlmem').textContent = last.sql_mem_gb.toFixed(1);
+    $('em-threads').textContent = last.threads.toLocaleString();
+    const labels = d.points.map(p => new Date(p.ts*1000).toLocaleTimeString());
+    emChart.data.labels = labels;
+    emChart.data.datasets[0].data = d.points.map(p => p.cpu_total);
+    emChart.data.datasets[1].data = d.points.map(p => p.cpu_user);
+    emChart.data.datasets[2].data = d.points.map(p => p.cpu_kern);
+    emChart.update('none');
+    emioChart.data.labels = labels;
+    emioChart.data.datasets[0].data = d.points.map(p => p.disk_riops);
+    emioChart.data.datasets[1].data = d.points.map(p => p.disk_wiops);
+    emioChart.data.datasets[2].data = d.points.map(p => p.disk_rmbps + p.disk_wmbps);
+    emioChart.update('none');
+  } catch(e) { /* EM may be disabled for this target */ }
+}
+setInterval(pollEnhanced, 7000);
+// remember last run target so metrics keep updating after the run ends
+setInterval(() => { if (running) cwTarget = $('r-target').value; }, 2000);
+
+// ---------------- tabs ----------------
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + name));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  if (name === 'history') refreshRuns();
+}
+
+// ---------------- history ----------------
+const fmtRunTime = utc => {
+  if (!utc) return '–';
+  const d = new Date(utc);
+  return d.toLocaleDateString('ko-KR', {month:'2-digit', day:'2-digit'}) + ' ' +
+         d.toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit', hour12:false});
+};
+async function refreshRuns() {
+  const rs = await api('/api/runs');
+  $('runs-table').querySelector('tbody').innerHTML = rs.map(r => `
+    <tr class="run-row" onclick="toggleRun('${r.run_id}')" style="cursor:pointer;">
+      <td><span id="arrow-${r.run_id}">▸</span> ${r.run_id}</td>
+      <td style="white-space:nowrap;">${fmtRunTime(r.started_at_utc)}</td>
+      <td>${r.label||''}</td><td>${r.config?.profile||''}</td>
+      <td>${r.config?.mode||''}</td><td>${r.config?.read_pct??''}</td>
+      <td>${r.avg_tps??'–'}</td><td>${r.total_errors??'–'}</td>
+      <td><a href="/api/runs/${r.run_id}" target="_blank" onclick="event.stopPropagation()">JSON</a></td></tr>
+    <tr id="detail-${r.run_id}" style="display:none;"><td colspan="9" id="detail-td-${r.run_id}" style="background:#0d1116; padding:14px;"></td></tr>`).join('');
+}
+
+const detailCharts = {};  // run_id -> [charts]
+async function toggleRun(runId) {
+  const row = $(`detail-${runId}`), arrow = $(`arrow-${runId}`);
+  if (row.style.display !== 'none') {           // collapse
+    row.style.display = 'none'; arrow.textContent = '▸';
+    (detailCharts[runId] || []).forEach(c => c.destroy());
+    delete detailCharts[runId];
+    return;
+  }
+  row.style.display = ''; arrow.textContent = '▾';
+  const td = $(`detail-td-${runId}`);
+  td.innerHTML = '<span style="color:#8a97a5">불러오는 중…</span>';
+  try {
+    const d = await api(`/api/runs/${runId}`);
+    const s = d.summary, meta = d.meta || {}, ts = (d.timeseries || []).filter(p => !p.warmup);
+    if (!s) { td.innerHTML = '<span style="color:#8a97a5">summary 없음 (실행 중이거나 비정상 종료)</span>'; return; }
+    const cfg = meta.config || {};
+    const perTxn = Object.entries(s.per_txn || {}).sort((a,b) => b[1].count - a[1].count);
+    td.innerHTML = `
+      <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:10px; font-size:12px;">
+        <span>평균 <b style="color:var(--accent); font-size:16px;">${(s.avg_tps??0).toLocaleString()} TPS</b></span>
+        <span>총 트랜잭션 <b>${(s.total_txns??0).toLocaleString()}</b></span>
+        <span>에러 <b style="color:${s.total_errors ? 'var(--err)' : 'var(--ok)'}">${s.total_errors??0}</b></span>
+        <span>측정 <b>${s.steady_seconds??0}s</b></span>
+        <span style="color:#8a97a5">${cfg.processes||'?'}proc × ${cfg.threads_per_process||'?'}thr · R${cfg.read_pct??'?'}% · ${meta.started_at_utc||''}</span>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
+        <div style="height:160px;"><canvas id="dc-tps-${runId}"></canvas></div>
+        <div style="height:160px;"><canvas id="dc-lat-${runId}"></canvas></div>
+      </div>
+      <div id="dc-em-wrap-${runId}" style="display:none; margin-bottom:12px;">
+        <div style="font-size:11px; color:#8a97a5; margin-bottom:4px;">RDS 서버 지표 (Enhanced Monitoring 5s) — <span id="dc-em-stats-${runId}"></span></div>
+        <div style="height:150px;"><canvas id="dc-em-${runId}"></canvas></div>
+      </div>
+      <table style="font-size:11px;">
+        <thead><tr><th>Transaction</th><th style="text-align:right">Count</th><th style="text-align:right">Err</th>
+          <th style="text-align:right">Mean</th><th style="text-align:right">p50</th>
+          <th style="text-align:right">p95</th><th style="text-align:right">p99</th><th style="text-align:right">Max (ms)</th></tr></thead>
+        <tbody>${perTxn.map(([name, m]) => `
+          <tr><td>${name}</td><td style="text-align:right">${m.count.toLocaleString()}</td>
+          <td style="text-align:right; color:${m.errors ? 'var(--err)' : 'inherit'}">${m.errors}</td>
+          <td style="text-align:right">${m.mean_ms.toFixed(1)}</td>
+          <td style="text-align:right">${m.p50_ms.toFixed(1)}</td>
+          <td style="text-align:right">${m.p95_ms.toFixed(1)}</td>
+          <td style="text-align:right">${m.p99_ms.toFixed(1)}</td>
+          <td style="text-align:right">${m.max_ms.toFixed(0)}</td></tr>`).join('')}
+        </tbody>
+      </table>`;
+    if (ts.length) {
+      const labels = ts.map(p => new Date(p.ts*1000).toLocaleTimeString());
+      detailCharts[runId] = [
+        mkChart($(`dc-tps-${runId}`),
+          [{label:'TPS', data:ts.map(p=>p.tps), borderColor:'#4da3ff', pointRadius:0, borderWidth:1.5},
+           {label:'errors', data:ts.map(p=>p.errors), borderColor:'#e5534b', pointRadius:0, borderWidth:1}], 'txn/s'),
+        mkChart($(`dc-lat-${runId}`),
+          [{label:'p50', data:ts.map(p=>p.p50), borderColor:'#3fb96c', pointRadius:0, borderWidth:1.5},
+           {label:'p95', data:ts.map(p=>p.p95), borderColor:'#e0a336', pointRadius:0, borderWidth:1.5},
+           {label:'p99', data:ts.map(p=>p.p99), borderColor:'#e5534b', pointRadius:0, borderWidth:1.5}], 'ms'),
+      ];
+      detailCharts[runId].forEach((c, i) => { c.data.labels = labels; c.update('none'); });
+    }
+    loadRunEM(runId);  // async, fills in when ready
+  } catch(e) { td.innerHTML = `<span style="color:var(--err)">로드 실패: ${e.message}</span>`; }
+}
+
+async function loadRunEM(runId) {
+  try {
+    const d = await api(`/api/runs/${runId}/enhanced`);
+    const pts = d.points || [];
+    const wrap = $(`dc-em-wrap-${runId}`);
+    if (!pts.length || !wrap) return;
+    const cpus = pts.map(p => p.cpu_total);
+    const avg = cpus.reduce((a,b)=>a+b,0)/cpus.length, max = Math.max(...cpus);
+    const mx = k => Math.max(...pts.map(p => p[k] || 0));
+    const conns = d.connections || [];
+    const connsMax = conns.length ? Math.round(Math.max(...conns.map(c=>c.conns))) : null;
+    $(`dc-em-stats-${runId}`).textContent =
+      `CPU 평균 ${avg.toFixed(1)}% · 최대 ${max.toFixed(1)}%`
+      + ` · IOPS r/w 최대 ${Math.round(mx('disk_riops'))}/${Math.round(mx('disk_wiops'))}`
+      + (mx('net_mbps') ? ` · net 최대 ${mx('net_mbps').toFixed(1)}MB/s` : '')
+      + (mx('sql_mem_gb') ? ` · SQL mem ${mx('sql_mem_gb').toFixed(1)}GB` : '')
+      + (connsMax !== null ? ` · conns 최대 ${connsMax}` : '');
+    wrap.style.display = '';
+    const c = mkChart($(`dc-em-${runId}`),
+      [{label:'CPU %', data:pts.map(p=>p.cpu_total), borderColor:'#4da3ff', backgroundColor:'rgba(77,163,255,.12)', fill:true, pointRadius:0, borderWidth:1.5, yAxisID:'y'},
+       {label:'write IOPS', data:pts.map(p=>p.disk_wiops), borderColor:'#e0a336', pointRadius:0, borderWidth:1, yAxisID:'y1'},
+       {label:'read IOPS', data:pts.map(p=>p.disk_riops), borderColor:'#3fb96c', pointRadius:0, borderWidth:1, yAxisID:'y1'}], 'CPU %');
+    c.options.scales.y.max = 100;
+    c.options.scales.y1 = {position:'right', beginAtZero:true, title:{display:true, text:'IOPS', color:'#8a97a5'}, ticks:{color:'#5c6773'}, grid:{drawOnChartArea:false}};
+    c.data.labels = pts.map(p => new Date(p.ts*1000).toLocaleTimeString());
+    c.update('none');
+    (detailCharts[runId] = detailCharts[runId] || []).push(c);
+  } catch(e) { /* EM unavailable for this run/target */ }
+}
+
+
+// ---------------- websocket ----------------
+function connectWS() {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+  ws.onopen = () => $('conn-dot').classList.add('on');
+  ws.onclose = () => { $('conn-dot').classList.remove('on'); setTimeout(connectWS, 2000); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.kind === 'point') addPoint(m.point);
+    else if (m.kind === 'seed') seedProgress(m.table, m.done, m.total);
+    else if (m.kind === 'ddl') $('seed-phase').textContent = `DDL ${m.db}: ${m.done}/${m.total}`;
+    else if (m.kind === 'seed_phase') {
+      const txt = {ddl:'⏳ 스키마 생성 중…', data:'⏳ 데이터 시딩 중…',
+                   finished:'✅ 시딩 완료', failed:'❌ 시딩 실패 — 서버 로그 확인'}[m.phase] || m.phase;
+      $('seed-phase').innerHTML = `<b>${txt}</b>`;
+      if (m.phase === 'finished' || m.phase === 'failed') $('seed-btn').disabled = false;
+    }
+  };
+}
+connectWS();
+
+// poll run status to flip badge back when finished
+setInterval(async () => {
+  const s = await api('/api/run/status').catch(() => null);
+  if (!s) return;
+  // page reloaded mid-run → restore progress UI from server state
+  if (s.status === 'running' && !running) {
+    running = true;
+    runPlan = {startedAt: s.started_at, warmup: s.config.warmup_sec,
+               duration: s.config.duration_sec, runId: s.run_id};
+    $('run-badge').textContent = 'running'; $('run-badge').className = 'badge running';
+    $('run-btn').disabled = true;
+    $('live-run-id').textContent = s.run_id;
+    $('run-progress').style.display = 'block';
+    if (!progressTimer) progressTimer = setInterval(updateProgress, 500);
+  }
+  if (s.status === 'finished' && running) {
+    running = false;
+    $('run-badge').textContent = '완료'; $('run-badge').className = 'badge';
+    onRunFinished(s.status);
+    refreshRuns();
+  } else if (s.status === 'stopping' && running) {
+    $('run-badge').textContent = '정지 중…';
+  }
+}, 1000);
+
+// targets first: applyPreset() picks the ladder's target out of the <select>.
+refreshTargets().then(refreshWorkloads).then(loadPresets); refreshRuns();
+</script>
+</body>
+</html>

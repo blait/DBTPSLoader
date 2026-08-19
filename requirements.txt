@@ -1,0 +1,11 @@
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+pyodbc>=5.1,<6.0
+pydantic>=2.7,<3.0
+hdrhistogram>=0.10,<1.0
+python-multipart>=0.0.9,<1.0
+PyYAML>=6.0,<7.0
+
+# CPU 지표를 RDS Enhanced Monitoring에서 읽을 때만 필요하다
+# (comparisons.yaml의 cpu.source가 rds_em인 경우).
+boto3>=1.34,<2.0

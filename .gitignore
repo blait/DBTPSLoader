@@ -1,0 +1,36 @@
+# 런 아티팩트 — 측정 결과는 커밋하지 않는다.
+# meta.json에는 시딩 플랜(테이블명·행수)이 스냅샷으로 들어가므로,
+# 대상 DB의 스키마 구조가 그대로 드러난다.
+runs/
+
+# 사용자가 편집한 시딩 플랜 / 워크로드 — 실제 스키마의 테이블·컬럼명을 담는다
+plans/
+workloads/
+
+# 로컬 설정 (연결 정보·비교 쌍)
+comparisons.local.yaml
+targets.json
+*.env
+.env
+
+# 키·인증 정보 — 절대 커밋되지 않게
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / 에디터
+.DS_Store
+.idea/
+.vscode/
+*.swp
