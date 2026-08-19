@@ -30,12 +30,16 @@ _NUM_TYPES = ("int", "bigint", "smallint", "tinyint", "decimal", "numeric",
               "money", "float", "real")
 
 # SELECT 목록에서 제외할 타입. pyodbc가 변환하지 못하거나 페이로드가 과도해서,
-# 부하 측정을 드라이버 변환 비용 측정으로 바꿔버린다.
+# 부하 측정을 드라이버 변환·네트워크 전송 비용 측정으로 바꿔버린다.
+# varbinary/binary도 제외한다 — 시딩이 최대 2KB를 넣으므로 매 조회마다 그만큼을
+# 전송하게 되고, 서버 측 처리보다 전송이 지배해 인스턴스 비교가 흐려진다.
 _UNREADABLE = ("xml", "geography", "geometry", "hierarchyid", "sql_variant",
-               "image", "text", "ntext", "timestamp", "rowversion")
+               "image", "text", "ntext", "timestamp", "rowversion",
+               "varbinary", "binary")
 
 # 값을 만들어 넣을 수 없는 타입. INSERT/UPDATE 대상에서 제외한다.
-_UNWRITABLE = _UNREADABLE + ("varbinary", "binary")
+# varbinary는 시딩에서는 넣지만(행 크기 재현), 부하 INSERT에서는 뺀다.
+_UNWRITABLE = _UNREADABLE
 
 
 def _param_for(c: Column) -> dict:
@@ -67,11 +71,14 @@ def _param_for(c: Column) -> dict:
 
 
 def _fk_param(fk_col: str, t: Table) -> dict | None:
-    """FK 컬럼이면 부모 테이블 범위에서 뽑는 명세. 아니면 None."""
+    """FK 컬럼이면 부모 테이블 범위에서 뽑는 명세. 아니면 None.
+
+    `of`는 "schema.table"이다. 테이블명만 쓰면 스키마가 다른 동명 테이블이
+    충돌해 잘못된 범위에서 id를 뽑는다.
+    """
     for fk in t.foreign_keys:
         if fk_col in fk.columns and len(fk.columns) == 1:
-            parent = fk.ref_table.split(".")[-1]
-            return {"gen": "skewed_id", "of": parent}
+            return {"gen": "skewed_id", "of": fk.ref_table}
     return None
 
 
@@ -90,7 +97,7 @@ def _reads(t: Table, db: str) -> list[dict]:
                 "database": db, "tables": [ref],
                 "sql": [f"SELECT {', '.join(quote(c) for c in cols)} "
                         f"FROM {fq} WHERE {quote(pk)} = ?"],
-                "params": [[{"gen": "skewed_id", "of": t.name}]],
+                "params": [[{"gen": "skewed_id", "of": ref}]],
                 "why": f"PK {quote(pk)} 단건 조회 — 인덱스 seek",
             })
 
@@ -100,8 +107,8 @@ def _reads(t: Table, db: str) -> list[dict]:
             # 복합 FK는 초안에서 만들지 않는다. 값 조합을 맞추려면 부모의 실제
             # 행을 읽어야 하는데, 그건 초안 휴리스틱으로 할 일이 아니다.
             continue
-        p_schema, _, parent = fk.ref_table.rpartition(".")
-        p_fq = qualify(p_schema or "dbo", parent)
+        parent = fk.ref_name
+        p_fq = qualify(fk.ref_schema, parent)
         child_cols = [c.name for c in t.columns if c.type not in _UNREADABLE][:4]
         if not child_cols:
             continue
@@ -113,13 +120,17 @@ def _reads(t: Table, db: str) -> list[dict]:
                     f"FROM {fq} c "
                     f"JOIN {p_fq} p ON p.{quote(fk.ref_columns[0])} = c.{quote(fk.columns[0])} "
                     f"WHERE c.{quote(fk.columns[0])} = ?"],
-            "params": [[{"gen": "skewed_id", "of": parent}]],
+            "params": [[{"gen": "skewed_id", "of": fk.ref_table}]],
             "why": f"FK {fk.name} 조인 — {quote(fk.columns[0])} → {parent}",
         })
 
     # NC 인덱스 키로 범위 조회. 인덱스를 실제로 타는 쿼리를 만드는 것이 목적이다.
     for ix in t.indexes:
         if ix.primary_key or not ix.columns:
+            continue
+        if ix.filtered:
+            # 필터 인덱스를 평범한 seek 키로 쓰면 임의 파라미터가 필터 조건을
+            # 벗어나 조용히 스캔이 된다. 필터 조건을 재현할 방법이 없으므로 건너뛴다.
             continue
         key = ix.columns[0]
         col = next((c for c in t.columns if c.name == key), None)
@@ -195,7 +206,7 @@ def _writes(t: Table, db: str) -> list[dict]:
                 "database": db, "tables": [ref],
                 "sql": [f"UPDATE {fq} SET {quote(target.name)} = ? "
                         f"WHERE {quote(pk)} = ?"],
-                "params": [[_param_for(target), {"gen": "uniform_id", "of": t.name}]],
+                "params": [[_param_for(target), {"gen": "uniform_id", "of": ref}]],
                 "why": f"{quote(target.name)} 갱신. 대상 id는 균등 분포 — 편중을 쓰면 "
                        f"모든 커넥션이 같은 행을 잠그려 들어 직렬화된다",
             })
@@ -204,17 +215,32 @@ def _writes(t: Table, db: str) -> list[dict]:
 
 def draft_workload(tables_by_db: dict[str, dict[str, Table]],
                    name: str = "draft",
-                   max_tables: int = 12) -> dict:
+                   max_tables: int = 12,
+                   plan: dict | None = None) -> dict:
     """스키마 → 트랜잭션 믹스 초안.
 
-    행수가 많은 테이블을 우선한다 — 부하가 실제 데이터 분포를 닮게 하려면
-    큰 테이블을 건드려야 한다. `max_tables`로 제한하는 이유는 200 테이블짜리
-    스키마에서 트랜잭션 수백 개를 만들면 사용자가 검토할 수 없기 때문이다.
+    큰 테이블을 우선한다 — 부하가 실제 데이터 분포를 닮게 하려면 큰 테이블을
+    건드려야 한다. `max_tables`로 제한하는 이유는 200 테이블짜리 스키마에서
+    트랜잭션 수백 개를 만들면 사용자가 검토할 수 없기 때문이다.
+
+    **`plan`을 넘기는 것이 정상 경로다.** 이 도구는 빈 DB를 전제로 하므로 조회
+    시점의 `row_count`는 전부 0이고, 그러면 정렬이 무의미해져 알파벳 순 앞쪽
+    테이블만 뽑힌다. 시딩 플랜의 행수를 쓰면 실제로 커질 테이블을 우선한다.
     """
-    ranked = sorted(
-        ((db, t) for db, tables in tables_by_db.items() for t in tables.values()),
-        key=lambda x: -x[1].row_count,
-    )
+    plan_rows: dict[str, int] = {}
+    if plan:
+        for e in plan.get("tables", []):
+            plan_rows[e.get("qualified") or f"{e.get('schema','dbo')}.{e['table']}"] = \
+                e.get("rows", 0)
+
+    def size_of(t: Table) -> int:
+        return plan_rows.get(t.qualified, t.row_count)
+
+    candidates = [(db, t) for db, tables in tables_by_db.items()
+                  for t in tables.values()
+                  # 플랜이 0행으로 둔 테이블은 조회해도 빈 결과다
+                  if not plan_rows or size_of(t) > 0]
+    ranked = sorted(candidates, key=lambda x: -size_of(x[1]))
     picked = ranked[:max_tables]
     dropped = len(ranked) - len(picked)
 
@@ -226,8 +252,15 @@ def draft_workload(tables_by_db: dict[str, dict[str, Table]],
     warnings = []
     if dropped > 0:
         # 조용히 자르지 않는다 — 잘린 것을 밝히지 않으면 "전체를 덮었다"로 읽힌다.
-        warnings.append(f"테이블 {dropped}개는 초안에서 제외됐다 (행수 상위 "
+        basis = "플랜 행수" if plan_rows else "현재 행수"
+        warnings.append(f"테이블 {dropped}개는 초안에서 제외됐다 ({basis} 상위 "
                         f"{max_tables}개만 사용). 필요하면 직접 추가할 것")
+    if not plan_rows:
+        # 빈 DB에서는 row_count가 전부 0이라 정렬이 무의미하다 — 알파벳 순으로
+        # 뽑히는 것을 사용자가 알아야 한다.
+        warnings.append("시딩 플랜 없이 생성했다 — 대상 DB가 비어 있으면 테이블 "
+                        "선택이 사실상 이름 순이 된다. 플랜을 먼저 저장하고 다시 "
+                        "생성하는 것을 권한다")
     no_index = [t["name"] for t in txns
                 if t["kind"] == "read" and "NC 인덱스" not in t.get("why", "")
                 and "PK" not in t.get("why", "") and "FK" not in t.get("why", "")]

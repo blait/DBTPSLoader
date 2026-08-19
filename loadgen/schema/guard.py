@@ -58,9 +58,14 @@ def check_empty(target: TargetDB, databases: list[str],
     }
 
 
-def require_empty(target: TargetDB, databases: list[str]) -> None:
-    """빈 DB가 아니면 예외. 쓰기를 수행하는 함수의 첫 줄에서 호출한다."""
-    result = check_empty(target, databases)
+def require_empty(target: TargetDB, databases: list[str],
+                  tables: dict[str, dict[str, Table]] | None = None) -> None:
+    """빈 DB가 아니면 예외. 쓰기를 수행하는 함수의 첫 줄에서 호출한다.
+
+    `tables`를 넘기면 이미 조회한 결과를 재사용한다 — 넘기지 않으면 한 번의
+    시딩에서 스키마를 네 번 조회하게 된다 (200 테이블이면 16회 왕복).
+    """
+    result = check_empty(target, databases, tables=tables)
     if result["table_count"] == 0:
         raise NotEmptyError(
             f"[{target.label}] {result['warning']} (대상 DB: {', '.join(databases)})")

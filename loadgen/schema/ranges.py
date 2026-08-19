@@ -52,12 +52,12 @@ def _pk_column(cur, schema: str, table: str) -> tuple[str, str] | None:
     return name, type_name
 
 
-def id_ranges(target: TargetDB, workload: dict) -> dict[str, int]:
-    """{테이블명(소문자): MAX(pk)} — 워크로드가 건드리는 테이블에 대해서만.
+def id_ranges(target: TargetDB, workload: dict) -> tuple[dict[str, int], list[str]]:
+    """({"schema.table"(소문자): MAX(pk)}, 미해결 목록).
 
-    조회에 실패한 테이블은 결과에서 빠진다. 0을 넣지 않는 이유: 빈 범위를 주면
-    파라미터 생성이 조용히 무의미한 값을 내놓는다. 키가 없으면 부하 시작 시
-    `coordinator`가 그 사실을 드러내며 거부한다.
+    미해결을 따로 돌려주는 이유: 일부만 해결된 상태로 런을 시작하면 그 테이블의
+    파라미터가 무의미해지고, 조회는 0행을 돌려주면서도 "성공한 트랜잭션"으로
+    집계된다. 호출부가 목록을 보고 런을 거부한다.
     """
     # 워크로드가 실제로 참조하는 테이블만 조회한다. 스키마 전체를 도는 것은
     # 200 테이블짜리 DB에서 불필요한 왕복이다.
@@ -66,13 +66,15 @@ def id_ranges(target: TargetDB, workload: dict) -> dict[str, int]:
         db = txn.get("database")
         if not db:
             continue
-        # 워크로드는 "schema.table" 또는 "table"을 담을 수 있다 (구버전 호환).
+        # 워크로드의 tables는 "schema.table" 형식이다. 이름에 점이 있으면 첫
+        # 점으로 쪼개야 한다 — 스키마 이름에는 점이 들어갈 수 없기 때문이다.
         for ref in txn.get("tables", []):
-            sch, _, name = ref.rpartition(".")
-            wanted.setdefault(db, set()).add((sch or "dbo", name))
+            sch, sep, name = ref.partition(".")
+            wanted.setdefault(db, set()).add((sch, name) if sep else ("dbo", ref))
 
     out: dict[str, int] = {}
     skipped: list[str] = []
+    unresolved: list[str] = []
     for db, tables in wanted.items():
         if not tables:
             continue
@@ -89,22 +91,29 @@ def id_ranges(target: TargetDB, workload: dict) -> dict[str, int]:
                     pk = _pk_column(cur, schema, table)
                     if not pk:
                         skipped.append(f"{key} (단일 숫자형 PK 없음)")
+                        unresolved.append(key)
                         continue
                     col, _ = pk
                     mx = cur.execute(
                         f"SELECT MAX({quote(col)}) FROM {object_name(schema, table)}"
                     ).fetchone()[0]
                 except Exception as exc:  # noqa: BLE001
+                    # 권한 부족을 조용히 넘기면 파라미터가 상수 1이 되어 조회가
+                    # 0행을 돌려주면서 "성공"으로 집계된다.
                     log.warning("id 범위 조회 실패 (%s.%s): %s", db, key, exc)
+                    unresolved.append(f"{key} ({str(exc)[:80]})")
                     continue
                 if not mx:
                     log.warning("%s.%s: 행이 없다 — 이 테이블을 쓰는 부하는 빈 결과가 된다",
                                 db, key)
+                    unresolved.append(f"{key} (행 없음)")
                     continue
-                # 키는 테이블명만 쓴다 — 워크로드의 `of` 참조와 맞춘다.
-                out[table.lower()] = int(mx)
+                # 키는 "schema.table" 소문자다. 테이블명만 쓰면 archive.Invoice(1000만 행)와
+                # sales.Invoice(120행)가 충돌해 좁은 범위가 이기고, 큰 테이블 조회가
+                # 전부 캐시에서 처리되어 TPS만 좋아 보인다.
+                out[key.lower()] = int(mx)
         finally:
             conn.close()
     if skipped:
         log.info("id 범위를 건너뛴 테이블 %d개: %s", len(skipped), ", ".join(skipped[:5]))
-    return out
+    return out, unresolved

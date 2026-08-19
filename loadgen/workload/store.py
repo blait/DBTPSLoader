@@ -45,11 +45,14 @@ def _value(spec: dict, g: Gen, ctx: dict):
     kind = spec.get("gen", "int")
 
     if kind in ("skewed_id", "uniform_id"):
-        max_id = ctx.get(spec.get("of", "").lower(), 0)
+        ref = spec.get("of", "").lower()
+        max_id = ctx.get(ref, 0)
         if max_id < 1:
-            # 범위를 모르면 1을 쓴다. 조용히 0이나 음수를 내보내면 조회가
-            # 0행을 돌려주고도 성공으로 집계된다.
-            return 1
+            # 상수를 대입하면 조회가 0~1행을 돌려주면서 "성공"으로 집계되어
+            # 부하가 조용히 무의미해진다. 런 시작 시 coordinator가 미해결
+            # 테이블을 걸러내므로 여기 도달하면 버그다.
+            raise ValueError(
+                f"id 범위 미해결: {ref} — 시딩 상태를 확인할 것")
         if kind == "uniform_id":
             return g.uniform_id(max_id)
         return g.skewed_id(max_id, skew=spec.get("skew", 4.0))

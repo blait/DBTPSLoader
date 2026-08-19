@@ -441,8 +441,13 @@ async def start_seed(s: SeedIn):
             status["phase"] = "data"
             _emit("seed_phase", {"phase": "data"})
             cfg = SeedConfig(batch_size=s.batch_size, workers=s.workers)
-            status["summary"] = seed_plan(target, runnable, cfg, progress=progress)
-            status["status"] = "finished"
+            summary = seed_plan(target, runnable, cfg, progress=progress,
+                                tables_by_db=tables)
+            status["summary"] = summary
+            # 계획대로 들어가지 않았으면 "완료"로 끝내지 않는다. 부하는 계획보다
+            # 작은 데이터를 상대하게 되고, 리포트는 그 사실을 알 수 없다.
+            status["status"] = "finished" if summary["ok"] else "incomplete"
+            status["errors"] += summary["problems"]
         except Exception as e:  # noqa: BLE001
             log.exception("seed failed")
             status["status"] = "failed"

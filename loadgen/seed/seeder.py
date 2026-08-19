@@ -101,7 +101,8 @@ def _set_fk_checks(target: TargetDB, database: str, enable: bool) -> list[str]:
     return failed
 
 
-def seed_minimal(target: TargetDB, database: str, skip: set[str], rows: int = 10,
+def seed_minimal(target: TargetDB, database: str, skip: set[str],
+                 ctx: Optional[dict] = None, rows: int = 10,
                  progress: Optional[ProgressCb] = None) -> list[str]:
     """플랜에 없는 빈 테이블에 소량의 행을 넣는다. 실패 목록을 돌려준다.
 
@@ -109,12 +110,16 @@ def seed_minimal(target: TargetDB, database: str, skip: set[str], rows: int = 10
     비어 있으면 조인이 0행을 반환하는데, 그것도 "성공한 트랜잭션"으로 집계되어
     서버가 일을 거의 하지 않고도 TPS가 높게 나온다.
 
-    `skip`은 "schema.table" 형식이다. 스키마명을 포함하지 않으면 서로 다른 스키마의
-    동명 테이블을 구분할 수 없다.
+    `ctx`(부모별 행수)를 반드시 넘겨야 한다. 비우면 모든 FK 컬럼이 1이 되어
+    이 테이블을 부모로 삼는 조인이 딱 1행만 돌려준다 — 조인 팬아웃을 만들려던
+    목적이 그대로 무너진다.
+
+    `skip`은 "schema.table" 형식이다.
     """
     from ..schema.introspect import introspect
-    from ..schema.values import value_for
+    from ..schema.values import can_generate, value_for
 
+    ctx = ctx or {}
     failures: list[str] = []
     try:
         tables = introspect(target, database)
@@ -125,24 +130,37 @@ def seed_minimal(target: TargetDB, database: str, skip: set[str], rows: int = 10
         cur = conn.cursor()
         g = Gen(seed=42)
         for key, t in sorted(tables.items()):
-            if key in skip or t.row_count > 0:
+            if key in skip or t.row_count > 0 or t.temporal:
                 continue
             insertable = [c for c in t.columns if c.insertable]
             if not insertable:
                 continue   # IDENTITY만 있는 테이블 — 넣을 것이 없다
+            bad = [c.name for c in insertable if not can_generate(c)]
+            if bad or t.has_check or t.has_trigger:
+                # 실패가 확실한 것은 시도하지 않는다. 다만 왜 비어 있는지는 남긴다.
+                failures.append(
+                    f"{key}: 건너뜀 — "
+                    + ("생성 불가 타입 " + ", ".join(bad[:2]) if bad
+                       else "CHECK 제약" if t.has_check else "트리거"))
+                continue
             cols = ", ".join(quote(c.name) for c in insertable)
             ph = ", ".join("?" for _ in insertable)
             sql = f"INSERT INTO {qualify(t.schema, t.name)} ({cols}) VALUES ({ph})"
-            fk_of = {fk.columns[0]: fk.ref_table.split(".")[-1]
+            fk_of = {fk.columns[0]: fk.ref_table
                      for fk in t.foreign_keys if len(fk.columns) == 1}
+            if any(len(fk.columns) > 1 for fk in t.foreign_keys):
+                failures.append(f"{key}: 건너뜀 — 복합 FK")
+                continue
             try:
                 data = [
-                    tuple(value_for(c, g, i, rows, {}, fk_parent=fk_of.get(c.name))
+                    tuple(value_for(c, g, i, rows, ctx, fk_parent=fk_of.get(c.name))
                           for c in insertable)
                     for i in range(1, rows + 1)
                 ]
                 cur.executemany(sql, data)
                 conn.commit()
+                # 이 테이블도 이후 자식의 FK 부모가 될 수 있으므로 범위에 넣는다.
+                ctx.setdefault(key.lower(), rows)
                 if progress:
                     progress(f"{database}.{key}", rows, rows)
             except Exception as e:  # noqa: BLE001
@@ -156,7 +174,8 @@ def seed_minimal(target: TargetDB, database: str, skip: set[str], rows: int = 10
 
 def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
               progress: Optional[ProgressCb] = None,
-              stop_event: Optional[threading.Event] = None) -> dict:
+              stop_event: Optional[threading.Event] = None,
+              tables_by_db: Optional[dict] = None) -> dict:
     """시딩 플랜을 실행한다.
 
     `plan`은 `loadgen.schema.plan`이 라이브 스키마를 조회해 만들고 사용자가 UI에서
@@ -173,7 +192,8 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
     databases = plan.get("databases") or sorted({t["database"] for t in tables})
 
     # 여기가 최종 관문이다. API 핸들러에만 두면 CLI 등 다른 경로로 우회된다.
-    require_empty(target, databases)
+    # 호출부가 이미 스키마를 조회했으면 재사용한다 (중복 조회 방지).
+    require_empty(target, databases, tables=tables_by_db)
 
     seeds = [
         TableSeed(database=t["database"], table=t["table"],
@@ -181,13 +201,13 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
                   factory=t["factory"], count_key=t["table"].lower())
         for t in tables
     ]
-    # ctx 키는 테이블명 소문자다 — 워크로드의 `of` 참조와 맞춰야 한다.
-    # 서로 다른 스키마에 동명 테이블이 있으면 큰 쪽을 남긴다 (FK 부모로 쓰일 때
-    # 범위가 좁으면 위반이 나므로, 좁은 쪽을 남기는 것이 더 위험하다).
-    ctx: dict[str, int] = {}
-    for t in tables:
-        k = t["table"].lower()
-        ctx[k] = max(ctx.get(k, 0), t["rows"])
+    # ctx 키는 "schema.table" 소문자다. 테이블명만 쓰면 서로 다른 스키마의 동명
+    # 테이블이 충돌해 잘못된 범위에서 FK 값을 뽑는다 (좁은 쪽이 이기면 큰 테이블
+    # 조회가 전부 캐시에서 처리되어 TPS만 좋아 보인다).
+    ctx: dict[str, int] = {
+        (t.get("qualified") or f"{t.get('schema', 'dbo')}.{t['table']}").lower(): t["rows"]
+        for t in tables
+    }
 
     done_lock = threading.Lock()
     done: dict[str, int] = {f"{ts.schema}.{ts.table}": 0 for ts in seeds}
@@ -232,7 +252,8 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
     seeded = {f"{ts.schema}.{ts.table}" for ts in seeds}
     minimal_failures: list[str] = []
     for db in databases:
-        minimal_failures += seed_minimal(target, db, skip=seeded, progress=progress)
+        minimal_failures += seed_minimal(target, db, skip=seeded, ctx=ctx,
+                                         progress=progress)
 
     fk_on_failures: list[str] = []
     for db in databases:
@@ -242,9 +263,39 @@ def seed_plan(target: TargetDB, plan: dict, cfg: SeedConfig,
             fk_on_failures.append(f"{db}: {str(e)[:200]}")
             log.warning("%s의 제약 재활성화 실패: %s", db, e)
 
+    # 계획과 실제를 대조한다. 이걸 안 하면 중복 키나 제약 위반으로 수십만 행이
+    # 사라져도 "finished"로 끝나고, 부하는 계획보다 훨씬 작은 데이터를 상대한다.
+    planned = {f"{ts.schema}.{ts.table}": t["rows"] for t, ts in zip(tables, seeds)}
+    shortfall = [
+        {"table": k, "planned": v, "inserted": done.get(k, 0),
+         "missing": v - done.get(k, 0)}
+        for k, v in planned.items() if done.get(k, 0) < v
+    ]
+
+    ok = not (errors or shortfall or fk_on_failures)
+    problems: list[str] = []
+    if shortfall:
+        top = shortfall[:3]
+        problems.append(
+            "행수 부족 " + ", ".join(
+                f"{s['table']} {s['inserted']:,}/{s['planned']:,}" for s in top)
+            + (f" 외 {len(shortfall) - len(top)}개" if len(shortfall) > len(top) else ""))
+    if errors:
+        problems.append(f"삽입 오류 {len(errors)}건: {errors[0]}")
+    if fk_on_failures:
+        # 제약을 다시 켜지 못했다 — DB가 미검증 상태로 남고, 다음 삽입에서
+        # 고아 행이나 중복이 조용히 들어간다.
+        problems.append(f"제약 재활성화 실패 {len(fk_on_failures)}개 — "
+                        f"DB가 제약 미검증 상태다: {fk_on_failures[0]}")
+    if fk_off_failures:
+        problems.append(f"제약 비활성화 실패 {len(fk_off_failures)}개 (ALTER 권한 확인)")
+
     return {
-        "targets": dict(ctx),
+        "ok": ok,
+        "problems": problems,
+        "targets": planned,
         "inserted": done,
+        "shortfall": shortfall,
         "errors": errors,
         "minimal_seed_failures": minimal_failures,
         # 제약을 끄거나 켜지 못한 테이블. 끄지 못했으면 FK 순서 문제로 삽입이

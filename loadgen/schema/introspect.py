@@ -35,6 +35,7 @@ class Column:
     computed: bool
     default: str | None = None
     generated: bool = False   # GENERATED ALWAYS (temporal 테이블의 period 컬럼)
+    collation: str | None = None
 
     @property
     def insertable(self) -> bool:
@@ -52,8 +53,19 @@ class Column:
 class ForeignKey:
     name: str
     columns: list[str]
-    ref_table: str
+    ref_schema: str
+    ref_name: str
     ref_columns: list[str]
+
+    @property
+    def ref_table(self) -> str:
+        """"schema.table" — ctx 키와 워크로드 `of` 참조에 쓴다.
+
+        스키마와 이름을 따로 보관하는 이유: 이름 자체에 점이 들어갈 수 있고
+        (`dbo.My.Table`은 유효하다), 합친 문자열을 rpartition으로 되쪼개면
+        `schema='dbo.My'`가 되어 존재하지 않는 객체를 가리킨다.
+        """
+        return f"{self.ref_schema}.{self.ref_name}"
 
 
 @dataclass
@@ -63,6 +75,7 @@ class Index:
     included: list[str]
     unique: bool
     primary_key: bool
+    filtered: bool = False   # 필터 인덱스 — seek 키로 쓰면 조용히 스캔이 된다
 
 
 @dataclass
@@ -132,7 +145,7 @@ ORDER BY s.name, t.name
 _Q_COLUMNS = """
 SELECT s.name, t.name, c.name, ty.name, c.max_length, c.precision, c.scale,
        c.is_nullable, c.is_identity, c.is_computed, dc.definition,
-       c.generated_always_type
+       c.generated_always_type, c.collation_name
 FROM sys.columns c
 JOIN sys.tables t ON t.object_id = c.object_id
 JOIN sys.schemas s ON s.schema_id = t.schema_id
@@ -142,20 +155,25 @@ WHERE t.is_ms_shipped = 0 AND t.temporal_type <> 1
 ORDER BY s.name, t.name, c.column_id
 """
 
+# i.type: 1=clustered rowstore, 2=nonclustered rowstore, 3=XML, 4=spatial,
+# 5=CCI, 6=NCCI, 7=hash. rowstore만 남긴다 — 나머지는 `WHERE col = ?` 형태의
+# seek 대상이 아니고, columnstore 컬럼을 seek 키로 쓰면 스캔이 된다.
+# has_filter도 함께 읽는다: 필터 인덱스를 평범한 seek 키로 쓰면 임의 파라미터가
+# 필터 조건을 벗어나 조용히 스캔이 된다.
 _Q_INDEXES = """
 SELECT s.name, t.name, i.name, i.is_unique, i.is_primary_key,
-       c.name, ic.is_included_column, ic.key_ordinal
+       c.name, ic.is_included_column, ic.key_ordinal, i.has_filter
 FROM sys.indexes i
 JOIN sys.tables t ON t.object_id = i.object_id
 JOIN sys.schemas s ON s.schema_id = t.schema_id
 JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-WHERE t.is_ms_shipped = 0 AND i.type > 0
+WHERE t.is_ms_shipped = 0 AND i.type IN (1, 2) AND t.temporal_type <> 1
 ORDER BY s.name, t.name, i.name, ic.is_included_column, ic.key_ordinal
 """
 
 _Q_FKS = """
-SELECT s.name, t.name, fk.name, pc.name, rs.name + '.' + rt.name, rc.name, fkc.constraint_column_id
+SELECT s.name, t.name, fk.name, pc.name, rs.name, rt.name, rc.name, fkc.constraint_column_id
 FROM sys.foreign_keys fk
 JOIN sys.tables t ON t.object_id = fk.parent_object_id
 JOIN sys.schemas s ON s.schema_id = t.schema_id
@@ -189,23 +207,25 @@ def introspect(target: TargetDB, database: str) -> dict[str, Table]:
 
         cur.execute(_Q_COLUMNS)
         for (sch, tname, cname, ctype, mlen, prec, scale, nul, ident, comp,
-             dflt, gen) in cur.fetchall():
+             dflt, gen, coll) in cur.fetchall():
             t = tables.get(f"{sch}.{tname}")
             if t is None:
                 continue
             t.columns.append(Column(
                 name=cname, type=ctype, max_length=mlen, precision=prec, scale=scale,
                 nullable=bool(nul), identity=bool(ident), computed=bool(comp),
-                default=dflt, generated=bool(gen)))
+                default=dflt, generated=bool(gen), collation=coll))
 
         cur.execute(_Q_INDEXES)
         idx_acc: dict[tuple[str, str], Index] = {}
-        for sch, tname, iname, uniq, is_pk, cname, included, _ord in cur.fetchall():
+        for (sch, tname, iname, uniq, is_pk, cname, included, _ord,
+             filt) in cur.fetchall():
             key = (f"{sch}.{tname}", iname)
             ix = idx_acc.get(key)
             if ix is None:
                 ix = idx_acc[key] = Index(name=iname, columns=[], included=[],
-                                          unique=bool(uniq), primary_key=bool(is_pk))
+                                          unique=bool(uniq), primary_key=bool(is_pk),
+                                          filtered=bool(filt))
             (ix.included if included else ix.columns).append(cname)
         for (tkey, _), ix in idx_acc.items():
             t = tables.get(tkey)
@@ -217,12 +237,13 @@ def introspect(target: TargetDB, database: str) -> dict[str, Table]:
 
         cur.execute(_Q_FKS)
         fk_acc: dict[tuple[str, str], ForeignKey] = {}
-        for sch, tname, fkname, col, ref_t, ref_c, _ord in cur.fetchall():
+        for sch, tname, fkname, col, ref_s, ref_n, ref_c, _ord in cur.fetchall():
             key = (f"{sch}.{tname}", fkname)
             fk = fk_acc.get(key)
             if fk is None:
                 fk = fk_acc[key] = ForeignKey(name=fkname, columns=[],
-                                              ref_table=ref_t, ref_columns=[])
+                                              ref_schema=ref_s, ref_name=ref_n,
+                                              ref_columns=[])
             fk.columns.append(col)
             fk.ref_columns.append(ref_c)
         for (tkey, _), fk in fk_acc.items():
@@ -276,8 +297,11 @@ def fingerprint(tables: dict[str, Table]) -> dict[str, tuple]:
     """
     return {
         key: (
+            # collation을 포함한다. 한쪽이 CI_AS, 다른 쪽이 CS_AS면 비교 의미와
+            # 인덱스 선택도·정렬 비용이 달라지는데, 그게 바로 측정 대상이다.
             tuple(sorted((c.name, c.type, c.max_length, c.nullable,
-                          c.identity, c.computed) for c in t.columns)),
+                          c.identity, c.computed, c.collation or "")
+                         for c in t.columns)),
             tuple(t.primary_key),
             tuple(sorted((fk.ref_table, tuple(fk.columns)) for fk in t.foreign_keys)),
             tuple(sorted((tuple(ix.columns), tuple(ix.included), ix.unique)

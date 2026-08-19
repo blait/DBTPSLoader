@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 
 from .introspect import Table
+from .values import can_generate
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +105,25 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
             insertable = [c for c in t.columns if c.insertable]
             uniq_ix = [ix for ix in t.indexes if ix.unique and not ix.primary_key]
             kind, weight = _classify(t, ref_count.get(key, 0))
+
+            # 시딩을 시도하면 반드시 실패하거나 잘못된 데이터가 되는 경우를
+            # 미리 걸러 0행으로 둔다. 실패한 배치는 5000행 단위로 통째로 죽고,
+            # 잘못된 데이터는 제약이 꺼진 상태로 그대로 들어간다.
+            bad_types = [c.name for c in insertable if not can_generate(c)]
+            composite_fk = [fk.name for fk in t.foreign_keys if len(fk.columns) > 1]
+            blockers = [b for b in (
+                (f"값을 만들 수 없는 타입: {', '.join(bad_types[:3])}"
+                 if bad_types else None),
+                (f"복합 FK {len(composite_fk)}개 — 값 조합을 맞출 수 없어 "
+                 f"고아 행이 남는다" if composite_fk else None),
+                ("CHECK 제약 — 합성값이 거부되면 배치 전체가 실패한다"
+                 if t.has_check else None),
+                ("트리거 — 삽입 결과를 예측할 수 없다" if t.has_trigger else None),
+                ("시스템 버전 관리(temporal) — 이력 테이블에 쓰기가 중복된다"
+                 if t.temporal else None),
+                ("삽입 가능한 컬럼이 없다 (IDENTITY/계산 컬럼뿐)"
+                 if not insertable else None),
+            ) if b]
             entries.append({
                 "database": db, "table": t.name, "schema": t.schema,
                 "qualified": key,
@@ -112,6 +132,9 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
                 "kind": kind,
                 "_weight": weight,
                 "columns": [c.name for c in insertable],
+                # 타입을 남긴다 — verify가 체크섬이 무시하는 컬럼을 알아야 한다.
+                "column_types": [{"name": c.name, "type": c.type}
+                                 for c in t.columns],
                 "skipped_columns": [
                     {"name": c.name,
                      "reason": ("IDENTITY" if c.identity else
@@ -124,30 +147,24 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
                      "ref_columns": fk.ref_columns}
                     for fk in t.foreign_keys
                 ],
-                # 트리거·CHECK 제약이 있으면 합성값이 거부될 수 있다. 조용히
-                # 넘기지 않고 사용자에게 보인다.
+                # 시딩을 막는 사유. 하나라도 있으면 0행이 되고, 사용자가 판단해
+                # 직접 행수를 넣을 수 있다 (그때는 실패를 감수하는 것이다).
+                "blockers": blockers,
                 "warnings": [w for w in (
-                    "트리거 있음 — 삽입 시 부수 효과가 생길 수 있다" if t.has_trigger else None,
-                    "CHECK 제약 있음 — 합성값이 거부될 수 있다" if t.has_check else None,
-                    "시스템 버전 관리(temporal) 테이블 — 이력이 함께 생성된다"
-                    if t.temporal else None,
-                    "삽입 가능한 컬럼이 없다 (IDENTITY/계산 컬럼뿐)"
-                    if not insertable else None,
-                    # 유니크 제약에 임의값을 넣으면 중복 키 위반이 난다. 행수가
-                    # 값 공간보다 크면 확률이 급격히 올라간다.
-                    f"유니크 제약 {len(uniq_ix)}개 — 행수가 많으면 중복 키 위반 가능"
+                    # 유니크 제약은 막지 않는다 — 값 생성 단계에서 순번을 섞어
+                    # 충돌을 피하므로, 알려주기만 한다.
+                    f"유니크 제약 {len(uniq_ix)}개 — 값에 행 순번을 섞어 생성한다"
                     if uniq_ix else None,
                 ) if w],
             })
 
-    # 가중치대로 총 행수를 분배
-    # 삽입 가능한 컬럼이 없는 테이블은 가중치 계산에서도 빼야 한다 — 넣지도 않을
-    # 테이블에 배분한 몫만큼 나머지가 줄어든다.
-    seedable = [e for e in entries if e["columns"]]
+    # 가중치대로 총 행수를 분배. 시딩할 수 없는 테이블은 계산에서 빼야 한다 —
+    # 넣지도 않을 테이블에 배분한 몫만큼 나머지가 줄어든다.
+    seedable = [e for e in entries if e["columns"] and not e["blockers"]]
     total_w = sum(e["_weight"] for e in seedable) or 1
     for e in entries:
-        e["rows"] = (max(_MIN_ROWS, round(total_rows * e["_weight"] / total_w))
-                     if e["columns"] else 0)
+        ok = bool(e["columns"]) and not e["blockers"]
+        e["rows"] = max(_MIN_ROWS, round(total_rows * e["_weight"] / total_w)) if ok else 0
         del e["_weight"]
 
     entries.sort(key=lambda e: (e["database"], e["order"]))
@@ -157,6 +174,9 @@ def draft_plan(tables_by_db: dict[str, dict[str, Table]],
         "total_rows_planned": sum(e["rows"] for e in entries),
         "databases": sorted(tables_by_db),
         "tables": entries,
+        # 시딩에서 제외된 테이블. 조용히 빠지면 "전체를 시딩했다"로 읽힌다.
+        "excluded": [{"table": e["qualified"], "reasons": e["blockers"]}
+                     for e in entries if e["blockers"]],
         # 사용자가 손대지 않았음을 기록한다 (리포트가 이 사실을 표시한다)
         "edited": False,
     }

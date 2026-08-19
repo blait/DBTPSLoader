@@ -43,14 +43,16 @@ class Run:
         # 매 시도가 error 547이 되고, 실패 경로가 커넥션을 매번 다시 여는 탓에
         # 성능 결과가 아니라 실패 표본을 측정하게 된다. ctx는 meta.json에 기록해
         # 워커가 실제로 쓴 범위가 런 기록에 남게 한다.
-        ctx = id_ranges(self.target, self.workload)
-        # 범위가 비면 부하가 무의미하다 — 조회는 0행을 돌려주고 쓰기는 FK 위반이
-        # 되는데, 양쪽 다 "성공한 트랜잭션"으로 집계되어 TPS만 높게 나온다.
-        # 시딩을 건너뛴 대상에 부하를 거는 실수가 여기서 걸린다.
-        if not ctx:
+        ctx, unresolved = id_ranges(self.target, self.workload)
+        # 하나라도 미해결이면 거부한다. 부분 통과를 허용하면 그 테이블의 부하가
+        # 조용히 무의미해지는데(조회 0행이 "성공"으로 집계된다), 리포트는 그 사실을
+        # 알 수 없다. 시딩을 건너뛴 대상에 부하를 거는 실수도 여기서 걸린다.
+        if not ctx or unresolved:
+            detail = "; ".join(unresolved[:5]) or "참조 테이블 없음"
+            more = f" 외 {len(unresolved) - 5}개" if len(unresolved) > 5 else ""
             raise RuntimeError(
-                f"[{self.target.label}] 워크로드가 참조하는 테이블에서 id 범위를 "
-                f"읽지 못했다 — 시딩이 되어 있는지 확인할 것")
+                f"[{self.target.label}] id 범위를 확정하지 못한 테이블이 있다 — "
+                f"시딩 상태와 PK 타입을 확인할 것: {detail}{more}")
         mp_ctx = mp.get_context("spawn")
         self._metrics_q = mp_ctx.Queue()
         self.started_at = time.time()
