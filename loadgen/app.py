@@ -31,10 +31,12 @@ from .runner.coordinator import Run
 from .schema import guard, introspect as schema_introspect
 from .schema.plan import draft_plan, load_plan, plan_names, save_plan
 from .schema.values import attach_factories
+from .schema.ranges import id_ranges
 from .schema.verify import compare_data
 from .seed.seeder import seed_plan
 from .workload import store as workload_store
 from .workload.draft import draft_workload
+from .workload.dryrun import dryrun
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -518,6 +520,41 @@ async def get_workload(name: str):
         return workload_store.load(name)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+
+
+class DryRunIn(BaseModel):
+    label: str
+    workload: dict
+    explain: bool = True
+
+
+@app.post("/api/workload/dryrun")
+async def workload_dryrun(body: DryRunIn):
+    """워크로드의 모든 SQL을 한 번씩 실행해 확인한다.
+
+    부하를 걸어봐야 아는 문제를 미리 잡는다 — 문법 오류, 0행 반환(에러가 아니라서
+    에러율 게이트에 걸리지 않는다), 풀스캔. 쓰기는 롤백하므로 데이터를 건드리지
+    않는다.
+    """
+    target = state["targets"].get(body.label)
+    if not target:
+        raise HTTPException(404, "unknown target")
+
+    def _work():
+        ctx, unresolved = id_ranges(target, body.workload)
+        result = dryrun(target, body.workload, ctx, explain=body.explain)
+        result["unresolved_ranges"] = unresolved
+        if unresolved:
+            # id 범위가 없으면 파라미터 생성부터 실패한다. 원인을 먼저 알린다.
+            result["ready"] = False
+            result["note"] = (f"id 범위를 확정하지 못한 테이블 {len(unresolved)}개 — "
+                              f"시딩 상태를 확인할 것: {unresolved[0]}")
+        return result
+
+    try:
+        return await asyncio.to_thread(_work)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, str(e)[:300])
 
 
 @app.put("/api/workload/{name}")

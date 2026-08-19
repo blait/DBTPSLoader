@@ -594,3 +594,48 @@ def test_draft_workload_uses_plan_rows_when_empty_db():
 def test_draft_workload_warns_without_plan():
     w = draft_workload({"db": _simple_schema()}, max_tables=2)
     assert any("플랜" in x for x in w["warnings"])
+
+
+# ============================================================================
+# 드라이런 — 부하 전에 SQL이 동작하는지 확인한다
+# ============================================================================
+
+from loadgen.workload.dryrun import _plan_verdict  # noqa: E402
+
+
+def test_plan_verdict_detects_scan():
+    # 스캔만 쓰는 조회는 작은 테이블에서는 빠르지만 실규모에서 전혀 다르다
+    v, note = _plan_verdict('<ShowPlanXML><Table Scan /></ShowPlanXML>')
+    assert v == "scan" and "Table Scan" in note
+
+
+def test_plan_verdict_detects_seek():
+    v, _ = _plan_verdict('<ShowPlanXML><Index Seek /></ShowPlanXML>')
+    assert v == "seek"
+
+
+def test_plan_verdict_mixed():
+    v, _ = _plan_verdict('<ShowPlanXML><Index Seek /><Table Scan /></ShowPlanXML>')
+    assert v == "mixed"
+
+
+def test_plan_verdict_no_plan():
+    assert _plan_verdict("")[0] == "unknown"
+
+
+def test_dryrun_reports_param_failure_without_db():
+    # id 범위가 없으면 파라미터 생성부터 실패한다. 연결 전에 걸려야 한다 —
+    # 시딩을 건너뛴 상태가 여기서 드러난다.
+    from loadgen.config import TargetDB
+    from loadgen.workload.dryrun import dryrun
+    wl = {"name": "t", "txns": [{
+        "name": "x", "kind": "read", "weight": 1, "database": "db",
+        "tables": ["dbo.t"], "sql": ["SELECT 1 FROM dbo.t WHERE Id = ?"],
+        "params": [[{"gen": "skewed_id", "of": "dbo.t"}]],
+    }]}
+    t = TargetDB(label="none", host="127.0.0.1", port=1, password="x",
+                 login_timeout=1)
+    r = dryrun(t, wl, ctx={})       # ctx 비어 있음
+    assert r["ready"] is False
+    assert r["results"][0]["status"] == "error"
+    assert "파라미터 생성 실패" in r["results"][0]["error"]

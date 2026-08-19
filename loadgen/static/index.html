@@ -149,7 +149,14 @@
       <button onclick="draftWorkload()" id="w-btn">믹스 초안 생성</button>
       <div id="w-warn" style="margin-top:6px; font-size:12px;"></div>
       <div id="w-txns" style="max-height:300px; overflow:auto; margin-top:6px;"></div>
-      <button onclick="saveWorkload()" class="secondary" id="w-save" style="margin-top:6px;">워크로드 저장</button>
+      <div class="row">
+        <button onclick="dryRun()" id="w-dry">쿼리 검증</button>
+        <button onclick="saveWorkload()" class="secondary" id="w-save">워크로드 저장</button>
+      </div>
+      <div class="hint">검증은 각 SQL을 한 번씩 실행한다. 쓰기는 롤백하므로 데이터를
+        건드리지 않는다. 0행 조회는 에러가 아니어서 부하 중에는 잡히지 않으므로
+        <b>여기서 확인하는 것이 유일한 방법</b>이다.</div>
+      <div id="w-dry-result" style="margin-top:8px; font-size:12px;"></div>
     </div>
 
     <div class="panel">
@@ -423,6 +430,36 @@ function renderWorkload() {
       <td><input type="checkbox" ${t.disabled ? 'checked' : ''} style="width:auto;"
            onchange="workload.txns[${i}].disabled=this.checked; workload.edited=true;"></td></tr>`).join('') +
     '</tbody></table><div class="hint">이름에 마우스를 올리면 판단 근거와 SQL 을 볼 수 있다.</div>';
+}
+async function dryRun() {
+  if (!workload) { $('w-dry-result').textContent = '먼저 초안을 생성할 것'; return; }
+  $('w-dry').disabled = true;
+  $('w-dry-result').innerHTML = '<span class="hint">검증 중…</span>';
+  try {
+    const r = await api('/api/workload/dryrun', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:$('sc-target').value, workload})});
+    const cls = r.error ? 'bad' : r.warn ? 'warn' : 'good';
+    const icon = s => s === 'ok' ? '✓' : s === 'warn' ? '⚠️' : '✗';
+    const planTxt = x => x.plan === 'seek' ? 'seek'
+      : x.plan === 'scan' ? '<span class="delta-bad">scan</span>'
+      : x.plan === 'mixed' ? 'mixed' : '–';
+    $('w-dry-result').innerHTML =
+      `<div class="callout ${cls}">${r.note}<br>
+        <span class="hint">정상 ${r.ok} · 경고 ${r.warn} · 오류 ${r.error}</span></div>` +
+      `<table><thead><tr><th></th><th>이름</th><th>행</th><th>ms</th><th>계획</th></tr></thead><tbody>` +
+      r.results.map(x => `<tr${x.status !== 'ok' ? ' class="invalid"' : ''}>
+        <td>${icon(x.status)}</td>
+        <td title="${(x.error || x.plan_note || '').replace(/"/g, '')}">${x.name}</td>
+        <td>${x.rows === null ? '–' : x.rows.toLocaleString()}</td>
+        <td>${x.ms === null ? '–' : x.ms}</td>
+        <td>${planTxt(x)}</td></tr>` +
+        (x.error ? `<tr><td></td><td colspan="4" class="hint">${x.error}</td></tr>` : '')
+      ).join('') + '</tbody></table>';
+  } catch(e) {
+    $('w-dry-result').innerHTML = `<div class="callout bad">검증 실패: ${e.message}</div>`;
+  }
+  $('w-dry').disabled = false;
 }
 async function saveWorkload() {
   if (!workload) { $('w-warn').textContent = '먼저 초안을 생성할 것'; return; }
