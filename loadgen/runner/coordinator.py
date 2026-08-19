@@ -46,15 +46,30 @@ class Run:
         # 성능 결과가 아니라 실패 표본을 측정하게 된다. ctx는 meta.json에 기록해
         # 워커가 실제로 쓴 범위가 런 기록에 남게 한다.
         ctx, unresolved = id_ranges(self.target, self.workload)
-        # 하나라도 미해결이면 거부한다. 부분 통과를 허용하면 그 테이블의 부하가
-        # 조용히 무의미해지는데(조회 0행이 "성공"으로 집계된다), 리포트는 그 사실을
-        # 알 수 없다. 시딩을 건너뛴 대상에 부하를 거는 실수도 여기서 걸린다.
-        if not ctx or unresolved:
-            detail = "; ".join(unresolved[:5]) or "참조 테이블 없음"
-            more = f" 외 {len(unresolved) - 5}개" if len(unresolved) > 5 else ""
+        # 파라미터가 **실제로 참조하는** 범위만 필수다. 워크로드의 `tables`에는
+        # 조인 상대가 들어 있지만 그 테이블의 id를 파라미터로 쓰지 않을 수 있다
+        # (복합 PK 테이블을 자식으로 조인하는 경우 — 범위가 없는 것이 정상이다).
+        needed = {
+            spec["of"].lower()
+            for txn in self.workload.get("txns", [])
+            if not txn.get("disabled")
+            for stmt in (txn.get("params") or [])
+            for spec in stmt
+            if spec.get("gen") in ("skewed_id", "uniform_id") and spec.get("of")
+        }
+        missing = sorted(needed - set(ctx))
+        # 없으면 파라미터가 상수가 되거나 예외가 나고, 조회는 0행을 돌려주면서
+        # "성공"으로 집계된다 — 부하가 조용히 무의미해진다. 시딩을 건너뛴 대상에
+        # 부하를 거는 실수도 여기서 걸린다.
+        if missing:
             raise RuntimeError(
-                f"[{self.target.label}] id 범위를 확정하지 못한 테이블이 있다 — "
-                f"시딩 상태와 PK 타입을 확인할 것: {detail}{more}")
+                f"[{self.target.label}] 파라미터가 참조하는 id 범위를 확정하지 "
+                f"못했다 — 시딩 상태와 PK 타입을 확인할 것: {', '.join(missing[:5])}"
+                + (f" 외 {len(missing) - 5}개" if len(missing) > 5 else ""))
+        if unresolved:
+            # 파라미터가 쓰지 않는 테이블이므로 진행하되, 기록은 남긴다.
+            log.info("id 범위를 얻지 못한 테이블 %d개 (파라미터가 참조하지 않음): %s",
+                     len(unresolved), ", ".join(unresolved[:5]))
         mp_ctx = mp.get_context("spawn")
         self._metrics_q = mp_ctx.Queue()
         self.started_at = time.time()

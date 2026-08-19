@@ -543,12 +543,21 @@ async def workload_dryrun(body: DryRunIn):
     def _work():
         ctx, unresolved = id_ranges(target, body.workload)
         result = dryrun(target, body.workload, ctx, explain=body.explain)
+        # 파라미터가 실제로 참조하는 범위만 필수다. 워크로드의 tables에는 조인
+        # 상대가 들어 있지만 그 id를 파라미터로 쓰지 않을 수 있다 (복합 PK 자식).
+        needed = {
+            sp["of"].lower()
+            for t in body.workload.get("txns", []) if not t.get("disabled")
+            for stmt in (t.get("params") or []) for sp in stmt
+            if sp.get("gen") in ("skewed_id", "uniform_id") and sp.get("of")
+        }
+        missing = sorted(needed - set(ctx))
         result["unresolved_ranges"] = unresolved
-        if unresolved:
-            # id 범위가 없으면 파라미터 생성부터 실패한다. 원인을 먼저 알린다.
+        result["missing_ranges"] = missing
+        if missing:
             result["ready"] = False
-            result["note"] = (f"id 범위를 확정하지 못한 테이블 {len(unresolved)}개 — "
-                              f"시딩 상태를 확인할 것: {unresolved[0]}")
+            result["note"] = (f"파라미터가 참조하는 id 범위 {len(missing)}개를 "
+                              f"확정하지 못했다 — 시딩 상태를 확인할 것: {missing[0]}")
         return result
 
     try:

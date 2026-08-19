@@ -743,3 +743,15 @@ def test_run_id_does_not_use_removed_profile():
     from loadgen.runner import coordinator
     src = inspect.getsource(coordinator)
     assert "cfg.profile" not in src
+
+
+def test_run_requires_only_referenced_ranges():
+    # 워크로드의 tables에는 조인 상대가 들어 있지만, 그 테이블의 id를 파라미터로
+    # 쓰지 않을 수 있다 (복합 PK 자식을 조인하는 경우 — 범위가 없는 것이 정상).
+    # 이것으로 런을 거부하면 정상적인 워크로드가 실행되지 않는다.
+    import inspect
+    from loadgen.runner import coordinator
+    src = inspect.getsource(coordinator.Run.start)
+    # tables 전체가 아니라 params의 of 참조로 판정해야 한다
+    assert '"of"' in src or "'of'" in src
+    assert "needed" in src and "missing" in src
